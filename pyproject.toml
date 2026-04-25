@@ -36,6 +36,9 @@ dependencies = [
     "opencv-python>=4.8.0",
     "imageio>=2.31.0",
     "cma",
+    "swig",
+    "gymnasium[box2d]"
+
 ]
 
 [project.optional-dependencies]
