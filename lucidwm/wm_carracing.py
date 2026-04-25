@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument("--vae-epochs", type=int, default=30)
     parser.add_argument("--vae-batch-size", type=int, default=128)
     parser.add_argument("--vae-lr", type=float, default=1e-3)
-    parser.add_argument("--vae-hidden-size", type=int, default=32)
+    parser.add_argument("--vae-latent-size", type=int, default=32)
 
     # Phase 3: MDN-RNN training
     parser.add_argument("--rnn-epochs", type=int, default=30)
@@ -169,6 +169,125 @@ def vae_loss(recon, target, mu, logvar):
     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     return (recon_loss + kl_loss) / target.size(0)
 
+# Memory Model (M): MDN-RNN
+class MDNRNN(nn.Module):
+    """Mixture Density Network + LSTM.
+
+    Predicts p(z_{t+1} | a_t, z_t, h_t) as mixture of N_GAUSS Gaussians.
+    Also predicts reward and done logits.
+
+    Input per step: [z_t, a_t] concatenated
+    Output: mixture params (log_pi, mu, sigma) for next latent, plus reward/done
+    """
+
+    def __init__(self, latent_dim, hidden_dim, n_gauss, action_dim=ASIZE):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.n_gauss = n_gauss
+
+        self.lstm = nn.LSTM(latent_dim + action_dim, hidden_dim, batch_first=True)
+
+        # MDN head: per Gaussian, output mu (L) + log_sigma (L) + logit (1)
+        self.mdn_linear = nn.Linear(hidden_dim, n_gauss * (2 * latent_dim + 1))
+        self.reward_head = nn.Linear(hidden_dim, 1)
+        self.done_head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, z, action, hidden=None):
+        """Sequence forward pass.
+
+        Args:
+            z:      (B, T, L)
+            action: (B, T, A)
+            hidden: optional (h0, c0) each (1, B, R)
+
+        Returns:
+            log_pi: (B, T, N)
+            mu:     (B, T, N, L)
+            sigma:  (B, T, N, L)
+            reward: (B, T, 1)
+            done:   (B, T, 1)
+            hidden: (h_n, c_n)
+        """
+        B, T, _ = z.shape
+        x = torch.cat([z, action], dim=-1)  # (B, T, L+A)
+        out, hidden = self.lstm(x) if hidden is None else self.lstm(x, hidden)
+        # out: (B, T, R)
+
+        mdn_out = self.mdn_linear(out)  # (B, T, N*(2L+1))
+        mdn_out = mdn_out.reshape(B, T, self.n_gauss, 2 * self.latent_dim + 1)
+
+        mu = mdn_out[:, :, :, :self.latent_dim]                           # (B,T,N,L)
+        sigma = torch.exp(mdn_out[:, :, :, self.latent_dim:2*self.latent_dim])  # (B,T,N,L)
+        log_pi = F.log_softmax(mdn_out[:, :, :, -1], dim=-1)              # (B,T,N)
+
+        return log_pi, mu, sigma, self.reward_head(out), self.done_head(out), hidden
+
+    def initial_hidden(self, batch_size, device):
+        return (torch.zeros(1, batch_size, self.hidden_dim, device=device),
+                torch.zeros(1, batch_size, self.hidden_dim, device=device))
+
+    def forward_single(self, z, action, hidden):
+        """Single-step forward for controller rollout.
+
+        Args: z (B,L), action (B,A), hidden (h,c)
+        Returns: hidden, h_out (B,R)
+        """
+        x = torch.cat([z, action], dim=-1).unsqueeze(1)  # (B, 1, L+A)
+        out, hidden = self.lstm(x, hidden)
+        return hidden, out.squeeze(1)
+
+def gmm_loss(z_next, log_pi, mu, sigma):
+    """Negative log-likelihood of z_next under the Gaussian mixture.
+
+    Args:
+        z_next: (B, T, L) target
+        log_pi: (B, T, N) log mixing coefficients
+        mu:     (B, T, N, L) means
+        sigma:  (B, T, N, L) stds
+
+    Returns: scalar NLL
+    """
+    z_next = z_next.unsqueeze(2)  # (B, T, 1, L)
+
+    # Log prob under each Gaussian, summed over latent dims
+    log_probs = -0.5 * (
+        ((z_next - mu) / sigma) ** 2 + 2 * torch.log(sigma) + np.log(2 * np.pi)
+    ).sum(dim=-1)  # (B, T, N)
+
+    # Log-sum-exp over mixture components
+    return -torch.logsumexp(log_pi + log_probs, dim=-1).mean()
+
+# Controller (C): Linear + CMA-ES
+class Controller(nn.Module):
+    """Linear controller: a_t = tanh(W [z_t; h_t] + b).
+
+    Deliberately tiny so model capacity lives in V and M.
+    """
+
+    def __init__(self, latent_dim, hidden_dim, action_dim=ASIZE):
+        super().__init__()
+        self.fc = nn.Linear(latent_dim + hidden_dim, action_dim)
+
+    def forward(self, z, h):
+        """z: (B, L), h: (B, R) -> action: (B, A) in [-1, 1]."""
+        return torch.tanh(self.fc(torch.cat([z, h], dim=-1)))
+
+    @property
+    def num_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+    def set_params(self, flat_params):
+        """Set from flat numpy array (for CMA-ES)."""
+        idx = 0
+        for p in self.parameters():
+            n = p.numel()
+            p.data.copy_(torch.from_numpy(flat_params[idx:idx+n]).reshape(p.shape).float())
+            idx += n
+
+    def get_params(self):
+        """Get as flat numpy array."""
+        return np.concatenate([p.data.cpu().numpy().flatten() for p in self.parameters()])
 
 # Datasets 
 class FrameDataset(Dataset):
@@ -268,6 +387,133 @@ def train_vae(args, device, logger):
     torch.save(vae.state_dict(), os.path.join(args.logdir, "vae.pt"))
     return vae
 
+def train_rnn(args, vae, device, logger):
+    dataset = SequenceDataset(os.path.join(args.logdir, "data"), vae, device, args.rnn_seq_len)
+    loader = DataLoader(dataset, batch_size=args.rnn_batch_size, shuffle=True,
+                        num_workers=4, pin_memory=True)
+    rnn = MDNRNN(latent_dim=args.vae_latent_size,
+                 hidden_dim=args.rnn_hidden_size,
+                 n_gauss=args.rnn_n_gauss).to(device)
+    opt = optim.Adam(rnn.parameters(), lr=args.rnn_lr)
+
+    print(f"Training MDN-RNN on {len(dataset)} sequences, {args.rnn_epochs} epochs")
+    step = 0
+    for epoch in range(args.rnn_epochs):
+        rnn.train()
+        total_gmm, total_rew = 0.0, 0.0
+        for batch in loader:
+            z = batch["z"].to(device)
+            act = batch["action"].to(device)
+            z_next = batch["z_next"].to(device)
+            rew = batch["reward"].to(device)
+            done = batch["done"].to(device)
+
+            log_pi, mu, sigma, pred_rew, pred_done, _ = rnn(z, act)
+            loss_g = gmm_loss(z_next, log_pi, mu, sigma)
+            loss_r = F.mse_loss(pred_rew.squeeze(-1), rew)
+            loss_d = F.binary_cross_entropy_with_logits(pred_done.squeeze(-1), done)
+            loss = loss_g + loss_r + loss_d
+
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(rnn.parameters(), 1.0)
+            opt.step()
+            total_gmm += loss_g.item()
+            total_rew += loss_r.item()
+            step += 1
+
+        print(f"  Epoch {epoch+1}/{args.rnn_epochs}  gmm={total_gmm/len(loader):.4f}  "
+              f"reward={total_rew/len(loader):.4f}")
+        logger.log({"rnn/gmm_loss": total_gmm/len(loader)}, step=step)
+
+    torch.save(rnn.state_dict(), os.path.join(args.logdir, "rnn.pt"))
+    return rnn
+
+def rollout_agent(env_id, vae, rnn, controller, device, max_steps=1000, render=False):
+    """Run a single episode with the full V+M+C agent. Returns total reward."""
+    import cv2
+    env = gym.make(env_id, render_mode="human" if render else None)
+    obs, _ = env.reset()
+    vae.eval(); rnn.eval(); controller.eval()
+
+    hidden = rnn.initial_hidden(1, device)
+    total_reward = 0.0
+    prev_action = torch.zeros(1, ASIZE, device=device)
+
+    with torch.no_grad():
+        for _ in range(max_steps):
+            frame = cv2.resize(obs, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+            frame_t = torch.from_numpy(
+                frame.astype(np.float32) / 255.0
+            ).permute(2, 0, 1).unsqueeze(0).to(device)  # (1, 3, 64, 64)
+
+            mu, _ = vae.encode(frame_t)                  # (1, L)
+            h = hidden[0].squeeze(0)                      # (1, R)
+            action = controller(mu, h)                    # (1, A)
+            hidden, _ = rnn.forward_single(mu, prev_action, hidden)
+            prev_action = action
+
+            env_action = action.squeeze(0).cpu().numpy()
+            env_action[1] = np.clip((env_action[1] + 1) / 2, 0, 1)
+            env_action[2] = np.clip((env_action[2] + 1) / 2, 0, 1)
+
+            obs, reward, terminated, truncated, _ = env.step(env_action)
+            total_reward += reward
+            if terminated or truncated:
+                break
+    env.close()
+    return total_reward
+
+def train_controller_cmaes(args, vae, rnn, device, logger):
+    """Train controller via CMA-ES to maximize expected reward."""
+    try:
+        import cma
+    except ImportError:
+        print("ERROR: pip install cma")
+        return None
+
+    controller = Controller(latent_dim=args.vae_latent_size,
+                            hidden_dim=args.rnn_hidden_size).to(device)
+    print(f"CMA-ES: {controller.num_params} params, pop={args.cma_pop_size}")
+
+    es = cma.CMAEvolutionStrategy(
+        controller.get_params(), args.cma_sigma,
+        {"popsize": args.cma_pop_size, "seed": args.seed},
+    )
+
+    best_reward, best_params = -float("inf"), None
+
+    for gen in range(args.cma_generations):
+        solutions = es.ask()
+        fitnesses = []
+        for params in solutions:
+            controller.set_params(np.array(params))
+            rewards = [rollout_agent(args.env_id, vae, rnn, controller, device)
+                       for _ in range(args.cma_n_rollouts)]
+            fitnesses.append(-np.mean(rewards))  # CMA-ES minimizes
+
+        es.tell(solutions, fitnesses)
+        gen_best = -min(fitnesses)
+        if gen_best > best_reward:
+            best_reward = gen_best
+            best_params = solutions[np.argmin(fitnesses)].copy()
+
+        print(f"  Gen {gen+1}/{args.cma_generations}  best={gen_best:.1f}  "
+              f"all-time={best_reward:.1f}")
+        logger.log({"cma/gen_best": gen_best, "cma/best": best_reward}, step=gen)
+
+        if best_reward >= args.cma_target_return:
+            print(f"  Target {args.cma_target_return} reached!")
+            break
+        if es.stop():
+            print(f"  CMA-ES converged at gen {gen+1}")
+            break
+
+    controller.set_params(np.array(best_params))
+    torch.save(controller.state_dict(), os.path.join(args.logdir, "controller.pt"))
+    print(f"  Best reward: {best_reward:.1f}")
+    return controller
+
 if __name__ == "__main__":
     args = parse_args() 
     set_seed(args.seed)
@@ -291,3 +537,36 @@ if __name__ == "__main__":
         vae = VAE().to(device)
         vae.load_state_dict(torch.load(os.path.join(args.logdir, "vae.pt"),
                                        map_location=device, weights_only=True))
+        
+    if not args.skip_rnn:
+        print(f"\n{'='*60}\nPhase 3: Training MDN-RNN\n{'='*60}")
+        rnn = train_rnn(args, vae, device, logger)
+    else:
+        rnn = MDNRNN(latent_dim=args.vae_latent_size,
+                     hidden_dim=args.rnn_hidden_size,
+                     n_gauss=args.rnn_n_gauss).to(device)
+        rnn.load_state_dict(torch.load(os.path.join(args.logdir, "rnn.pt"),
+                                       map_location=device, weights_only=True))
+
+    if not args.skip_cma:
+        print(f"\n{'='*60}\nPhase 4: CMA-ES Controller\n{'='*60}")
+        controller = train_controller_cmaes(args, vae, rnn, device, logger)
+    else:
+        controller = Controller(latent_dim=args.vae_latent_size,
+                                hidden_dim=args.rnn_hidden_size).to(device)
+        controller.load_state_dict(torch.load(os.path.join(args.logdir, "controller.pt"),
+                                              map_location=device, weights_only=True))
+
+    if controller is not None:
+        print(f"\n{'='*60}\nFinal Evaluation (100 rollouts)\n{'='*60}")
+        rewards = []
+        for i in range(100):
+            r = rollout_agent(args.env_id, vae, rnn, controller, device)
+            rewards.append(r)
+            if (i+1) % 10 == 0:
+                print(f"  {i+1}/100  mean={np.mean(rewards):.1f} +/- {np.std(rewards):.1f}")
+        print(f"\nFinal: {np.mean(rewards):.1f} +/- {np.std(rewards):.1f}")
+        logger.log({"eval/mean_return": float(np.mean(rewards))}, step=0)
+
+    logger.close()
+    print("Done.")

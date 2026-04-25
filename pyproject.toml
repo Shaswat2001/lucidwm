@@ -35,6 +35,7 @@ dependencies = [
     "tqdm>=4.66.0",
     "opencv-python>=4.8.0",
     "imageio>=2.31.0",
+    "cma",
 ]
 
 [project.optional-dependencies]
