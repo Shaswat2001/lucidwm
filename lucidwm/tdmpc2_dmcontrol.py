@@ -127,7 +127,7 @@ class SimNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (..., D) where D is divisible by self.dim."""
         shape = x.shape
-        x = x.view(x.shape[:-1], -1, self.dim)
+        x = x.view(*x.shape[:-1], -1, self.dim)
         x = F.softmax(x, dim=-1)
         return x.view(*shape)
     
@@ -214,18 +214,18 @@ class TDMPC2Model(nn.Module):
         )
 
         self.dynamics = nn.Sequential(
-            mlp(args.latent_dim + action_dim, args.latent_dim),
+            mlp(args.latent_dim + action_dim, args.latent_dim, args.hidden_dim),
             SimNorm(args.simnorm_dim)
         )
 
-        self.rewards = mlp(args.latent_dim + action_dim, args.num_bins)
+        self.rewards = mlp(args.latent_dim + action_dim, args.num_bins, args.hidden_dim)
 
-        self.termination = mlp(args.latent_dim + action_dim, 1)
+        self.termination = mlp(args.latent_dim + action_dim, 1, args.hidden_dim)
 
-        self.policy_prior = mlp(args.latent_dim, 2 * action_dim)
+        self.policy_prior = mlp(args.latent_dim, 2 * action_dim, args.hidden_dim)
 
         self.q = nn.ModuleList([
-            mlp(args.latent_dim + action_dim, args.num_bins) for _ in range(args.num_q)
+            mlp(args.latent_dim + action_dim, args.num_bins, args.hidden_dim) for _ in range(args.num_q)
         ])
 
     @staticmethod
@@ -487,8 +487,84 @@ class OfflineDataset:
             "done": done_batch,
         }
 
-# Training
+# MPPI planning
+@torch.no_grad()
+def plan_mppi(
+    model: TDMPC2Model,
+    args,
+    z: torch.Tensor,
+    prev_mean: torch.Tensor | None,
+    horizon: int,
+    action_dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MPPI planning with policy prior in latent space.
 
+    Uses the policy network to generate action priors, then refines
+    with MPPI. Key difference from pure MPPI: initial samples come
+    from the policy, not uniform noise.
+
+    Args:
+        model: TD-MPC2 model (eval mode)
+        z: (1, LATENT_DIM) current latent state
+        prev_mean: (horizon, action_dim) previous plan (for warm-start), or None
+        horizon: planning horizon
+        action_dim: action space dimension
+        device: torch device
+
+    Returns:
+        action: (action_dim,) selected first action
+        mean: (horizon, action_dim) updated plan for warm-start
+    """
+    z = z.expand(args.mppi_n, -1)  # (N, LATENT_DIM)
+
+    # Warm-start: shift previous plan by 1 step
+    if prev_mean is not None:
+        mean = torch.cat([prev_mean[1:], prev_mean[-1:]], dim=0)  # (H, A)
+    else:
+        mean = torch.zeros(horizon, action_dim, device=device)
+
+    std = 2.0 * torch.ones(horizon, action_dim, device=device)
+
+    for _ in range(args.mppi_iter):
+        # Sample actions: mix policy prior with Gaussian perturbation
+        actions = mean.unsqueeze(0) + std.unsqueeze(0) * torch.randn(
+            args.mppi_n, horizon, action_dim, device=device
+        )
+        actions = actions.clamp(-1, 1)  # (N, H, A)
+
+        # Replace half the samples with policy-generated actions
+        n_policy = args.mppi_n // 2
+        s = z[:n_policy]
+        for t in range(horizon):
+            pi_action, _ = model.policy(s)
+            actions[:n_policy, t] = pi_action
+            s = model.next_state(s, pi_action)
+
+        # Evaluate all candidates
+        s = z.clone()
+        total_reward = torch.zeros(args.mppi_n, device=device)
+        for t in range(horizon):
+            r_logits = model.reward(s, actions[:, t])
+            total_reward += decode_bins(r_logits, args.num_bins)
+            s = model.next_state(s, actions[:, t])
+
+        # Terminal value: min of 2 random Q-heads
+        final_action, _ = model.policy(s)
+        q_logits = model.q_values(s, final_action)
+        idx = torch.randperm(args.num_q)[:2]
+        q1 = decode_bins(q_logits[idx[0]], args.num_bins)
+        q2 = decode_bins(q_logits[idx[1]], args.num_bins)
+        total_reward += torch.min(q1, q2)
+
+        # Softmax weighting
+        weights = F.softmax(total_reward / args.mppi_temp, dim=0)  # (N,)
+        mean = (weights[:, None, None] * actions).sum(dim=0)   # (H, A)
+        std = (std * 0.5).clamp(min=0.05)
+
+    return mean[0], mean
+
+# Training
 def update(
     model: TDMPC2Model,
     target_model: TDMPC2Model,
@@ -546,7 +622,7 @@ def update(
 
         # ── Reward loss (discrete regression, cross-entropy) ──────────
         r_logits = model.reward(z, a_t)                            # (B, NUM_BINS)
-        r_target = two_hot_encode(reward[:, t])                    # (B, NUM_BINS)
+        r_target = two_hot_encode(reward[:, t], args.num_bins)                    # (B, NUM_BINS)
         reward_loss = -(r_target * F.log_softmax(r_logits, dim=-1)).sum(dim=-1).mean()
         total_loss = total_loss + reward_loss
         reward_loss_sum += reward_loss.item()
@@ -560,8 +636,8 @@ def update(
             # TD target: min of 2 random Q-heads from target
             q_target_logits = target_model.q_values(z_next_target, a_next)
             idx = torch.randperm(args.num_q)[:2]
-            q1_target = decode_bins(q_target_logits[idx[0]])
-            q2_target = decode_bins(q_target_logits[idx[1]])
+            q1_target = decode_bins(q_target_logits[idx[0]], args.num_bins)
+            q2_target = decode_bins(q_target_logits[idx[1]], args.num_bins)
             q_next = torch.min(q1_target, q2_target)
             # TD target with entropy bonus
             gamma = args.discount * (1 - done[:, t])
@@ -569,7 +645,7 @@ def update(
 
         # Loss for each Q-head
         q_logits_all = model.q_values(z.detach(), a_t)
-        td_target_encoded = two_hot_encode(td_target)
+        td_target_encoded = two_hot_encode(td_target, args.num_bins)
         for q_logits in q_logits_all:
             q_loss = -(td_target_encoded * F.log_softmax(q_logits, dim=-1)).sum(-1).mean()
             total_loss = total_loss + q_loss / args.num_q
@@ -585,8 +661,8 @@ def update(
     q_logits_all = model.q_values(z_policy, a_pi)
     # Use min of 2 random Q-heads for policy update
     idx = torch.randperm(args.num_q)[:2]
-    q1 = decode_bins(q_logits_all[idx[0]])
-    q2 = decode_bins(q_logits_all[idx[1]])
+    q1 = decode_bins(q_logits_all[idx[0]], args.num_bins)
+    q2 = decode_bins(q_logits_all[idx[1]], args.num_bins)
     q_min = torch.min(q1, q2)
     policy_loss = (args.entropy_coef * log_prob - q_min).mean()
     total_loss = total_loss + policy_loss
@@ -691,7 +767,7 @@ if __name__ == "__main__":
         action_dim = dataset.action_all.shape[-1]
 
         # Models
-        model = TDMPC2Model(obs_dim, action_dim).to(device)
+        model = TDMPC2Model(obs_dim, action_dim, args).to(device)
         target_model = copy.deepcopy(model).to(device)
         target_model.requires_grad_(False)
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -719,3 +795,112 @@ if __name__ == "__main__":
         print("Saved checkpoint.")
 
         logger.close()
+    else:
+        # Environment
+        env = make_env(args.env_id, args.seed, action_repeat=args.action_repeat)
+        obs_dim = env.observation_space.shape[0]
+        action_dim = env.action_space.shape[0]
+
+        # Models
+        model = TDMPC2Model(obs_dim, action_dim, args).to(device)
+        target_model = copy.deepcopy(model).to(device)
+        target_model.requires_grad_(False)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+        # Replay buffer
+        seq_len = args.horizon + 1
+        buffer = ReplayBuffer(
+            capacity=1_000_000,
+            obs_shape=(obs_dim,),
+            action_dim=action_dim,
+            seq_len=seq_len,
+        )
+
+        # Logger
+        run_name = f"tdmpc2_{args.env_id}_s{args.seed}"
+        logger = Logger(
+            project=args.wandb_project, name=run_name,
+            config=vars(args), use_wandb=args.track,
+        )
+
+        print(f"TD-MPC2 ONLINE | env={args.env_id} | obs={obs_dim} | act={action_dim} | "
+              f"params={sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+
+        # ── Online training loop ──────────────────────────────────────
+        obs, _ = env.reset(seed=args.seed)
+        episode_return = 0.0
+        episode_length = 0
+        prev_mean = None
+
+        for step in range(args.total_steps):
+            # Act
+            if step < args.prefill_steps:
+                action = env.action_space.sample()
+            else:
+                with torch.no_grad():
+                    obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    z = model.encode(obs_t)
+                    action, prev_mean = plan_mppi(
+                        model, args, z, prev_mean, args.horizon, action_dim, device,
+                    )
+                    action = action.cpu().numpy()
+
+            # Step env
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            buffer.add_step(obs, action, reward, done)
+
+            episode_return += reward
+            episode_length += 1
+            obs = next_obs
+
+            if done:
+                logger.log({
+                    "charts/episodic_return": episode_return,
+                    "charts/episodic_length": episode_length,
+                }, step=step)
+                obs, _ = env.reset()
+                episode_return = 0.0
+                episode_length = 0
+                prev_mean = None
+
+            # Train
+            if step >= args.prefill_steps and buffer.num_episodes >= 1:
+                for _ in range(args.utd):
+                    try:
+                        batch = buffer.sample(args.batch_size, seq_len=seq_len)
+                    except ValueError:
+                        break
+                    metrics = update(model, target_model, optimizer, batch, args, device)
+
+                if step % 1000 == 0:
+                    logger.log(metrics, step=step)
+
+            # Evaluate
+            if step > 0 and step % args.eval_freq == 0:
+                model.eval()
+
+                def agent_fn(o):
+                    with torch.no_grad():
+                        o_t = torch.tensor(o, dtype=torch.float32, device=device).unsqueeze(0)
+                        z = model.encode(o_t)
+                        a, _ = model.policy(z, deterministic=True)
+                        return a.squeeze(0).cpu().numpy()
+
+                eval_result = evaluate(
+                    lambda: make_env(args.env_id, args.seed + 100,
+                                     action_repeat=args.action_repeat),
+                    agent_fn,
+                    num_episodes=args.eval_episodes,
+                )
+                model.train()
+
+                print(f"Step {step:>7d} | eval={eval_result['mean_return']:.1f} "
+                      f"+/- {eval_result['std_return']:.1f}")
+                logger.log({
+                    "charts/eval_return": eval_result["mean_return"],
+                    "charts/eval_std": eval_result["std_return"],
+                }, step=step)
+
+        logger.close()
+        print("Done.")

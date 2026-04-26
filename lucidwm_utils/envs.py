@@ -104,6 +104,37 @@ class PixelObservation(gym.ObservationWrapper):
         pixels = cv2.resize(pixels, (self.size, self.size), interpolation=cv2.INTER_AREA)
         return pixels.transpose(2, 0, 1).astype(np.float32) / 255.0
 
+class FlattenDMCObservation(gym.ObservationWrapper):
+    """Flatten DMControl's dict observation into a single state vector.
+
+    DMControl via shimmy returns OrderedDict observations with keys like
+    'orientations', 'velocity', 'height', etc. This wrapper concatenates
+    all values into a single flat float32 vector.
+
+    Used by: TD-MPC2, PWM, PlaNet (state mode), Dreamer (state mode).
+    """
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        # Compute flat obs dim by inspecting the observation space
+        if isinstance(env.observation_space, gym.spaces.Dict):
+            total_dim = 0
+            for key, space in env.observation_space.spaces.items():
+                total_dim += int(np.prod(space.shape))
+            self.observation_space = gym.spaces.Box(
+                low=-np.inf, high=np.inf, shape=(total_dim,), dtype=np.float64
+            )
+        else:
+            # Already flat, just pass through
+            self.observation_space = env.observation_space
+
+    def observation(self, obs):
+        if isinstance(obs, dict):
+            return np.concatenate(
+                [np.asarray(v, dtype=np.float64).flatten() for v in obs.values()]
+            )
+        return obs
+
 # Factory
 def make_env(
     env_id: str,
@@ -171,19 +202,38 @@ def _detect_suite(env_id: str) -> str:
         return "metaworld"
     return "gym"
 
-def _make_dmc(env_id: str, seed: int, img_size: int, action_repeat: int) -> gym.Env:
-    """Create DMControl environment with pixel observations."""
+def _make_dmc(
+    env_id: str, seed: int, obs: str = "state",
+    img_size: int = 64, action_repeat: int = 2,
+) -> gym.Env:
+    """Create DMControl environment with state or pixel observations.
+
+    Args:
+        env_id: "domain-task" format, e.g., "walker-walk"
+        seed: random seed
+        obs: "state" for flat proprioceptive vector, "rgb" for pixel images
+        img_size: pixel obs resolution (only used when obs="rgb")
+        action_repeat: action repeat factor
+
+    State mode wrapper stack:
+        DmControlCompatibilityV0 -> FlattenDMCObservation -> ActionRepeat -> NormalizeActions
+
+    Pixel mode wrapper stack:
+        DmControlCompatibilityV0 -> PixelObservation -> ActionRepeat -> NormalizeActions
+    """
     domain, task = env_id.split("-", 1)
 
-    # Use shimmy to wrap dm_control for gymnasium compatibility
     from shimmy import DmControlCompatibilityV0
-
     import dm_control.suite as suite
 
     dm_env = suite.load(domain, task, task_kwargs={"random": seed})
     env = DmControlCompatibilityV0(dm_env, render_mode="rgb_array")
 
-    env = PixelObservation(env, size=img_size)
+    if obs == "rgb":
+        env = PixelObservation(env, size=img_size)
+    else:
+        env = FlattenDMCObservation(env)
+
     env = ActionRepeatWrapper(env, repeat=action_repeat)
     env = NormalizeActions(env)
     env = gym.wrappers.RecordEpisodeStatistics(env)
