@@ -34,6 +34,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LucidWM: World Models (Ha & Schmidhuber)")
 
     # Standard args
+    parser.add_argument("--env-id", type=str, default="CarRacing-v3")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--track", action="store_true", help="Track with W&B")
     parser.add_argument("--wandb-project", type=str, default="lucidwm")
@@ -525,10 +526,9 @@ if __name__ == "__main__":
                     config=vars(args), use_wandb=args.track)
 
     data_dir = os.path.join(args.logdir, "data")
-    env_id = "CarRacing-v3"
     if not args.skip_data:
         print(f"\n{'='*60}\nPhase 1: Collecting {args.num_rollouts} rollouts\n{'='*60}")
-        collect_data(env_id, args.num_rollouts, args.max_steps, data_dir, args.seed)
+        collect_data(args.env_id, args.num_rollouts, args.max_steps, data_dir, args.seed)
     
     if not args.skip_vae:
         print(f"\n{'='*60}\nPhase 2: Training VAE\n{'='*60}")
@@ -561,7 +561,7 @@ if __name__ == "__main__":
         print(f"\n{'='*60}\nFinal Evaluation (100 rollouts)\n{'='*60}")
         rewards = []
         for i in range(100):
-            r = rollout_agent(env_id, vae, rnn, controller, device)
+            r = rollout_agent(args.env_id, vae, rnn, controller, device)
             rewards.append(r)
             if (i+1) % 10 == 0:
                 print(f"  {i+1}/100  mean={np.mean(rewards):.1f} +/- {np.std(rewards):.1f}")
