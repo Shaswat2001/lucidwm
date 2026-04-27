@@ -47,7 +47,7 @@ Compute: ~4-8 hours for world model training on RTX 3080+
 """
 
 import os
-import cv2
+import pickle
 import argparse
 import numpy as np
 from pathlib import Path
@@ -394,67 +394,146 @@ class TransitionViT(nn.Module):
 
         return self.pred_head(x_last)  # (B, N, E)
 
+# Dataset: PushT (matching official repo format)
+# Adapted from: https://github.com/gaoyuezhou/dino_wm/blob/main/datasets/pusht_dset.py
 class TrajectoryDataset(Dataset):
-    """Dataset of (observation, action) trajectories for DINO-WM training.
+    """PushT dataset matching the official DINO-WM repo format.
 
-    Expects data as npz files with keys 'obs' (T, H, W, 3) uint8
-    and 'action' (T, A) float32.
+    Loads video episodes (.mp4) via decord and action tensors (.pth).
+    DINO-WM uses ONLY visual observations, not proprioceptive state.
 
-    Each sample is a context window of H+1 consecutive frames
-    (H context + 1 target) with corresponding actions.
+    Args:
+        data_path: path to dataset dir (e.g., "data/pusht_dataset/train")
+        n_rollout: number of rollouts to load (None = all)
+        normalize_action: normalize actions by precomputed stats
+        relative: use relative actions (True) or absolute (False)
+        action_scale: scale factor for actions
+        with_velocity: include agent velocity in state
+        img_size: resize images to this size
     """
 
-    def __init__(self, data_dir: str, context_len: int,
-                 img_size: int, frameskip: int = 1):
-        self.context_len = context_len
-        self.frameskip = frameskip
+    def __init__(
+        self,
+        data_path: str,
+        n_rollout: int | None = None,
+        normalize_action: bool = True,
+        relative: bool = True,
+        action_scale: float = 100.0,
+        with_velocity: bool = True,
+        img_size: int= 224,
+    ):
+        
+        self.data_path = Path(data_path)
         self.img_size = img_size
-        self.episodes = []
 
-        for ep_file in sorted(Path(data_dir).glob("*.npz")):
-            data = np.load(ep_file)
-            self.episodes.append({
-                "obs": data["obs"],       # (T, H, W, 3) uint8
-                "action": data["action"].astype(np.float32),  # (T, A)
-            })
+        self.pusht_action_mean = torch.tensor([-0.0087, 0.0068])
+        self.pusht_action_std = torch.tensor([0.2019, 0.2002])
 
-        # Build index: (episode_idx, start_t) for valid windows
-        self.index = []
-        window = (context_len + 1) * frameskip
-        for ep_idx, ep in enumerate(self.episodes):
-            T = len(ep["obs"])
-            for start in range(T - window):
-                self.index.append((ep_idx, start))
+        self.states = torch.load(self.data_path / "states.pth", weights_only=True).float()
+
+        if relative:
+            self.actions = torch.load(self.data_path / "rel_actions.pth", weights_only=True)
+        else:
+            self.actions = torch.load(self.data_path / "abs_actions.pth", weights_only=True)
+        self.actions = self.actions.float() / action_scale
+
+        with open(self.data_path / "seq_lengths.pkl", "rb") as f:
+            self.seq_lengths = pickle.load(f)
+
+        n = n_rollout if n_rollout else len(self.states)
+        self.states = self.states[:n]
+        self.actions = self.actions[:n]
+        self.seq_lengths = self.seq_lengths[:n]
+
+        # Proprio: first 2 dims of state (agent position)
+        self.proprios = self.states[..., :2].clone()
+
+        if with_velocity:
+            vel_path = self.data_path / "velocities.pth"
+            if vel_path.exists():
+                velocities = torch.load(vel_path, weights_only=True)[:n].float()
+                self.states = torch.cat([self.states, velocities], dim=-1)
+                self.proprios = torch.cat([self.proprios, velocities], dim=-1)
+
+        if normalize_action:
+            self.actions = (self.actions - self.pusht_action_mean) / self.pusht_action_std
+
+        self.action_dim = self.actions.shape[-1]
+        print(f"Loaded {n} rollouts (action_dim={self.action_dim})")
+
+    def get_seq_length(self, idx: int) -> int:
+        return self.seq_lengths[idx]
+
+    def get_frames(self, idx: int, frames: list[int] | range):
+        """Load video frames and actions for an episode.
+
+        Returns:
+            obs: {"visual": (T, 3, H, W) float [0,1], "proprio": (T, D)}
+            actions: (T, A)
+            states: (T, S)
+
+        DINO-WM uses only obs["visual"]. Proprio is for baselines.
+        """
+        try:
+            from decord import VideoReader
+            import decord
+            decord.bridge.set_bridge("torch")
+        except ImportError:
+            raise ImportError("decord required for PushT videos: pip install decord")
+
+        vid_path = self.data_path / "obses" / f"episode_{idx:03d}.mp4"
+        reader = VideoReader(str(vid_path), num_threads=1)
+
+        image = reader.get_batch(frames).float() / 255.0  # (T, H, W, C)
+        image = image.permute(0, 3, 1, 2)                  # (T, C, H, W)
+
+        if image.shape[-1] != self.img_size:
+            image = F.interpolate(image, size=(self.img_size, self.img_size),
+                                  mode="bilinear", align_corners=False)
+
+        obs = {"visual": image, "proprio": self.proprios[idx, frames]}
+        return obs, self.actions[idx, frames], self.states[idx, frames]
 
     def __len__(self):
-        return len(self.index)
+        return len(self.seq_lengths)
 
     def __getitem__(self, idx):
-        ep_idx, start = self.index[idx]
-        ep = self.episodes[ep_idx]
+        T = self.get_seq_length(idx)
+        return self.get_frames(idx, range(T))
 
-        # Sample context_len + 1 frames with frameskip
-        frame_indices = [start + i * self.frameskip for i in range(self.context_len + 1)]
-        action_indices = [start + i * self.frameskip for i in range(self.context_len)]
 
-        frames = []
-        for fi in frame_indices:
-            img = ep["obs"][fi]  # (H, W, 3) uint8
-            img = self.preprocess(img)
-            frames.append(img)
+class TrajSlicerDataset(Dataset):
+    """Slice trajectories into fixed-length windows for training.
 
-        actions = np.stack([ep["action"][ai] for ai in action_indices])
+    Matching the official repo's TrajSlicerDataset.
 
-        return {
-            "frames": torch.stack(frames),           # (H+1, 3, 224, 224)
-            "actions": torch.from_numpy(actions),     # (H, A)
-        }
+    Args:
+        traj_dataset: PushTDataset instance
+        num_frames: window size (context_len + 1)
+        frameskip: skip between frames (0 = consecutive)
+    """
 
-    def preprocess(self, img):
-        """Resize and normalize image to [0, 1]."""
-        img = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA)
-        img = img.astype(np.float32) / 255.0
-        return torch.from_numpy(img.transpose(2, 0, 1))  # (3, H, W)
+    def __init__(self, traj_dataset: TrajectoryDataset, num_frames: int, frameskip: int = 0):
+        self.traj_dataset = traj_dataset
+        self.num_frames = num_frames
+        self.effective_skip = frameskip + 1
+
+        self.slices = []
+        for ep_idx in range(len(traj_dataset)):
+            T = traj_dataset.get_seq_length(ep_idx)
+            window_size = num_frames * self.effective_skip
+            for start in range(T - window_size + 1):
+                self.slices.append((ep_idx, start))
+
+    def __len__(self):
+        return len(self.slices)
+
+    def __getitem__(self, idx):
+        ep_idx, start = self.slices[idx]
+        frames = list(range(start, start + self.num_frames * self.effective_skip,
+                            self.effective_skip))
+        obs, actions, states = self.traj_dataset.get_frames(ep_idx, frames)
+        return obs, actions, states
 
 # Training
 def train_world_model(encoder, transition, dataset, args, device, logger):
@@ -622,6 +701,10 @@ if __name__ == "__main__":
     # ── Build transition model ────────────────────────────────────────
     transition = TransitionViT(
         embedding_dim=args.embedding_dim,
+        depth=args.vit_depth,
+        num_heads=args.vit_heads,
+        mlp_dim=args.vit_mlp_dim,
+        num_patches=args.num_patches,
         action_dim=args.action_dim,
         context_len=args.context_len,
     ).to(device)
@@ -631,12 +714,12 @@ if __name__ == "__main__":
     # ── Phase 1: Train world model ────────────────────────────────────
     if not args.skip_train:
         print(f"\n{'='*60}\nPhase 1: Training DINO-WM\n{'='*60}")
-        dataset = TrajectoryDataset(
-            args.data_dir,
-            context_len=args.context_len,
-            frameskip=args.frameskip,
-            img_size=args.img_size,
-        )
+        pusht_dataset = TrajectoryDataset(
+            data_path=args.data_dir,
+                img_size=args.img_size,
+            )
+        num_frames = args.context_len + 1
+        dataset = TrajSlicerDataset(pusht_dataset, num_frames, frameskip=args.frameskip)
         transition = train_world_model(encoder, transition, dataset, args, device, logger)
     else:
         print("Loading existing transition model...")
