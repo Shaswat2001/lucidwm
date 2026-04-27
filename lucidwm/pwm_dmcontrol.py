@@ -547,7 +547,7 @@ if __name__ == "__main__":
             action_dim = env.action_space.shape[0]
             env.close()
 
-        world_model = PWMModel(obs_dim, action_dim).to(device)
+        world_model = PWMModel(obs_dim, action_dim, args).to(device)
 
         # Try to load state dict (handle both direct and nested formats)
         if "model" in ckpt:
@@ -575,7 +575,7 @@ if __name__ == "__main__":
         obs_dim = dataset.obs_all.shape[-1]
         action_dim = dataset.action_all.shape[-1]
 
-        world_model = PWMModel(obs_dim, action_dim).to(device)
+        world_model = PWMModel(obs_dim, action_dim, args).to(device)
         world_model = pretrain_world_model(world_model, dataset, args, device, logger)
 
         # Save
