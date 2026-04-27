@@ -62,6 +62,9 @@ from lucidwm_utils.metrics import evaluate
 from lucidwm_utils.logger import Logger
 from lucidwm_utils.misc import set_seed, get_device
 
+from lucidwm_components.networks import MLP
+from lucidwm_components.distribution import TwoHotDist, SimNorm
+
 def parse_args():
     parser = argparse.ArgumentParser(description="LucidWM: PWM")
 
@@ -108,73 +111,6 @@ def parse_args():
 
     return parser.parse_args()
 
-# SimNorm
-class SimNorm(nn.Module):
-    """Simplicial normalization. Groups of V elements -> softmax each group."""
-
-    def __init__(self, dim: int):
-        super(SimNorm, self).__init__()
-        self.dim = dim
-    
-    def forward(self, x: torch.Tensor):
-        shape = x.shape
-        x = x.view(*x.shape[:-1], -1, self.dim)
-        x = F.softmax(x, dim=-1)
-        return x.view(*shape)
-
-# MLP block 
-def mlp(in_dim: int, out_dim: int, hidden_dim: int, num_layers=2):
-    """MLP with LayerNorm + Mish (TD-MPC2 / PWM style)."""
-    layers = []
-    dims = [in_dim] + [hidden_dim] * num_layers + [out_dim]
-    for i in range(len(dims) - 1):
-        layers.append(nn.Linear(dims[i], dims[i + 1]))
-        if i < len(dims) - 2:
-            layers.append(nn.LayerNorm(dims[i + 1]))
-            layers.append(nn.Mish())
-    return nn.Sequential(*layers)
-
-# Discrete Regression (log-spaced bins)
-def two_hot_encode(x: torch.Tensor, num_bins: int) -> torch.Tensor:
-    """Encode scalar into two-hot vector over log-spaced bins.
-
-    Bins are symmetric around 0 with log spacing: symlog applied to raw values,
-    then linearly interpolated between nearest bins.
-
-    Args:
-        x: (...) scalar values
-
-    Returns:
-        (..., num_bins) two-hot encoded
-    """
-    bins = symlog_bins(num_bins, x.device)
-    x = x.clamp(bins[0], bins[-1])
-    below = torch.bucketize(x, bins) - 1
-    below = below.clamp(0, num_bins - 2)
-    above = below + 1
-    weight = (x - bins[below]) / (bins[above] - bins[below] + 1e-8)
-    target = torch.zeros(*x.shape, num_bins, device=x.device)
-    target.scatter_(-1, below.unsqueeze(-1), (1 - weight).unsqueeze(-1))
-    target.scatter_(-1, above.unsqueeze(-1), weight.unsqueeze(-1))
-    return target
-
-def decode_bins(logits: torch.Tensor, num_bins: int) -> torch.Tensor:
-    """Decode logits over bins to scalar via expected value.
-
-    Args:
-        logits: (..., num_bins)
-
-    Returns:
-        (...) scalar values
-    """
-    bins = symlog_bins(num_bins, logits.device)
-    probs = F.softmax(logits, dim=-1)
-    return (probs * bins).sum(dim=-1)
-
-def symlog_bins(num_bins: int, device: torch.device) -> torch.Tensor:
-    """Generate log-spaced symmetric bins in [-20, 20]."""
-    return torch.linspace(-20, 20, num_bins, device=device)
-
 # PWM World Model
 class PWMModel(nn.Module):
     """TD-MPC2-style implicit world model used as a differentiable simulator.
@@ -191,9 +127,11 @@ class PWMModel(nn.Module):
     def __init__(self, obs_dim: int, action_dim: int, args):
         super(PWMModel, self).__init__()
 
-        self.encoder = nn.Sequential(mlp(obs_dim, args.latent_dim, args.hidden_dim), SimNorm(args.simnorm_dim))
-        self.dynamics = nn.Sequential(mlp(args.latent_dim+action_dim, self.latent_dim, args.hidden_dim), SimNorm(args.simnorm_dim))
-        self.rewards = mlp(args.latent_dim+action_dim, args.num_bins, args.hidden_dim)
+        self.encoder = nn.Sequential(MLP(obs_dim, args.latent_dim, args.hidden_dim, activation=nn.Mish), SimNorm(args.simnorm_dim))
+        self.dynamics = nn.Sequential(MLP(args.latent_dim+action_dim, self.latent_dim, args.hidden_dim, activation=nn.Mish), SimNorm(args.simnorm_dim))
+        self.rewards = MLP(args.latent_dim+action_dim, args.num_bins, args.hidden_dim, activation=nn.Mish)
+        self.two_hot_distribution = TwoHotDist(num_bins=args.num_bins)
+
         self.apply(self._init_weights)
 
     @staticmethod
@@ -214,10 +152,13 @@ class PWMModel(nn.Module):
     def reward(self, z, a):
         """(z, a) -> reward logits (B, NUM_BINS)."""
         return self.rewards(torch.cat([z, a], dim=-1))
+    
+    def reward_encode(self, x):
+        return self.two_hot_distribution.encode(x)
 
     def reward_scalar(self, z, a):
         """(z, a) -> scalar reward (B,). Differentiable through softmax."""
-        return decode_bins(self.reward(z, a))
+        return self.two_hot_distribution.decode(self.reward(z, a))
     
 class PWMPolicy(nn.Module):
     """Squashed Gaussian policy: z -> (mu, log_std) -> tanh(sample).
@@ -228,7 +169,7 @@ class PWMPolicy(nn.Module):
 
     def __init__(self, args, action_dim):
         super().__init__()
-        self.net = mlp(args.latent_dim, 2 * action_dim)
+        self.net = MLP(args.latent_dim, 2 * action_dim, activation=nn.Mish)
 
     def forward(self, z, deterministic=False):
         """z (B, LATENT) -> action (B, A), log_prob (B,)."""
@@ -263,7 +204,7 @@ class PWMCriticEnsemble(nn.Module):
     def __init__(self, args, num_critics=3):
         super().__init__()
         self.critics = nn.ModuleList([
-            mlp(args.latent_dim, 1) for _ in range(num_critics)
+            MLP(args.latent_dim, 1, activation=nn.Mish) for _ in range(num_critics)
         ])
 
     def forward(self, z):
@@ -318,7 +259,7 @@ def pretrain_world_model(world_model, dataset, args, device, logger):
 
                 # Reward: discrete regression cross-entropy
                 r_logits = world_model.reward(z, action[:, t])
-                r_target = two_hot_encode(reward[:, t])
+                r_target = world_model.reward_encode(reward[:, t])
                 reward_loss = -(r_target * F.log_softmax(r_logits, dim=-1)).sum(-1).mean()
 
                 total_loss = total_loss + (args.discount ** t) * (consistency + reward_loss)
@@ -576,6 +517,7 @@ if __name__ == "__main__":
         action_dim = dataset.action_all.shape[-1]
 
         world_model = PWMModel(obs_dim, action_dim, args).to(device)
+        two_hot_distribution = 
         world_model = pretrain_world_model(world_model, dataset, args, device, logger)
 
         # Save
