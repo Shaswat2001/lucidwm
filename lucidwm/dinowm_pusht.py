@@ -372,7 +372,7 @@ class TransitionViT(nn.Module):
         # (action conditioning happens upstream of attention, matching repo)
         x = z_seq.clone()
         for t in range(H):
-            a_emb = self.action_embed(a_seq[:, t])  # (B, 1, E)
+            a_emb = self.action_embedding(a_seq[:, t])  # (B, 1, E)
             x[:, t] = x[:, t] + a_emb               # broadcast: (B, N, E)
 
         # Flatten to single sequence: (B, H*N, E)
@@ -557,8 +557,15 @@ def train_world_model(encoder, transition, dataset, args, device, logger):
         epoch_loss = 0.0
 
         for batch in loader:
-            frames = batch["frames"].to(device)   # (B, H+1, 3, 224, 224)
-            actions = batch["actions"].to(device)  # (B, H, A)
+            if isinstance(batch, (tuple, list)):
+                # PushT format: (obs_dict, actions, states)
+                obs_dict, actions, _ = batch
+                frames = obs_dict["visual"].to(device)  # (B, T, 3, H, W)
+                actions = actions[:, :-1].to(device)     # (B, H, A) -- drop last action
+            else:
+                # Generic dict format
+                frames = batch["frames"].to(device)      # (B, H+1, 3, H, W)
+                actions = batch["actions"].to(device)     # (B, H, A)
 
             B, T, C, H_img, W_img = frames.shape
 
@@ -694,13 +701,13 @@ if __name__ == "__main__":
 
     # ── Load frozen DINOv2 encoder ────────────────────────────────────
     print("Loading DINOv2 encoder (frozen)...")
-    encoder = DINOv2Encoder().to(device)
+    encoder = DINOv2Encoder(args.dino_model).to(device)
     print(f"  DINOv2 loaded: {args.dino_model}, embed_dim={args.dino_embed_dim}, "
           f"patches={args.num_patches}")
 
     # ── Build transition model ────────────────────────────────────────
     transition = TransitionViT(
-        embedding_dim=args.embedding_dim,
+        embedding_dim=args.dino_embed_dim,
         depth=args.vit_depth,
         num_heads=args.vit_heads,
         mlp_dim=args.vit_mlp_dim,

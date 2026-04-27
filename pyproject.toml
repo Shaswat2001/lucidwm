@@ -37,8 +37,8 @@ dependencies = [
     "imageio>=2.31.0",
     "cma",
     "swig",
-    "gymnasium[box2d]"
-
+    "gymnasium[box2d]",
+    "decord"
 ]
 
 [project.optional-dependencies]
