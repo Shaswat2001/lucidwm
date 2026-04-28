@@ -21,8 +21,6 @@ LucidWM puts each algorithm in one Python file. You read one file, you understan
 
 ```
 lucidwm_components/     Layer 1: Reusable building blocks
-├── rssm.py               GaussianRSSM, CategoricalRSSM
-├── planners.py            CEMPlanner, MPPIPlanner, MCTSPlanner
 ├── networks.py            ConvEncoder, ConvDecoder, MLP, ResidualBlock
 └── distributions.py       symlog, TwoHotDist, PercentileNormalizer, lambda_returns
 
