@@ -56,11 +56,14 @@ crafter = [
 metaworld = [
     "metaworld>=2.0.0",
 ]
+minari = [
+    "minari",
+]
 wandb = [
     "wandb>=0.16.0",
 ]
 all = [
-    "lucidwm[atari,crafter,metaworld,wandb]",
+    "lucidwm[atari,crafter,metaworld,wandb, minari]",
 ]
 dev = [
     "ruff>=0.3.0",

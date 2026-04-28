@@ -91,8 +91,6 @@ The library spans five distinct paradigm families:
 
 **Learned JEPA** (LeWM): Learn perception end-to-end but prevent collapse with SIGReg (a statistical test enforcing Gaussian latents). Two loss terms total. ~15M params on a single GPU in hours.
 
-**RSSM / Dreamer** (stubs): The Dreamer line with recurrent state-space models and actor-critic in imagination. Stubs are scaffolded with full docstrings and component wiring.
-
 ## Contributing
 
 1. Create a single `.py` file in `lucidwm/`
