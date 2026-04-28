@@ -74,7 +74,13 @@ def parse_args():
     parser.add_argument("--logdir", type=str, default="exp/lewm")
 
     # Data
-    parser.add_argument("--data-dir", type=str, required=True)
+    parser.add_argument("--data-path", type=str, default=None,
+                        help="Path to pusht_expert_train.h5. If not provided, "
+                             "downloads from HuggingFace automatically.")
+    parser.add_argument("--hf-repo", type=str, default="quentinll/lewm-pusht",
+                        help="HuggingFace dataset repo for auto-download")
+    parser.add_argument("--hf-filename", type=str, default="pusht_expert_train.h5.zst",
+                        help="Filename within the HF repo (zstd-compressed)")
     parser.add_argument("--img-size", type=int, default=96)
     parser.add_argument("--frameskip", type=int, default=1)
 
@@ -205,7 +211,7 @@ class LeWMEncoder(nn.Module):
                 dim_feedforward=self.embed_dim * 4,
                 activation="gelu", batch_first=True, norm_first=True,
             )
-            for _ in range(args.enc_depths)
+            for _ in range(args.enc_depth)
         ])
         self.norm = nn.LayerNorm(self.embed_dim)
 
@@ -291,7 +297,7 @@ class LeWMPredictor(nn.Module):
         # Transformer blocks
         self.blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
-                d_model=self.pred_dim, nhead=args.enc_heads,
+                d_model=self.pred_dim, nhead=args.pred_heads,
                 dim_feedforward=self.pred_dim * 4,
                 activation="gelu", batch_first=True, norm_first=True,
                 dropout=args.pred_dropout,
@@ -357,9 +363,12 @@ def train(encoder, predictor, enc_projector, pred_projector, dataset, args, devi
     Both encoder, predictor, and projectors are optimized jointly.
     No stop-gradient, no EMA, no frozen parameters.
     """
+    has_gpu = torch.cuda.is_available()
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                        num_workers=4, pin_memory=True, drop_last=True)
-
+                        num_workers=4, pin_memory=has_gpu, drop_last=True,
+                        worker_init_fn=LeWMH5Dataset.worker_init_fn,
+                        persistent_workers=True)
+    
     params = (list(encoder.parameters()) + list(predictor.parameters()) +
               list(enc_projector.parameters()) + list(pred_projector.parameters()))
     optimizer = optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
@@ -561,20 +570,27 @@ class LeWMH5Dataset(Dataset):
         self.h5_path = h5_path
         self.img_size = img_size
         self.frameskip = frameskip
+
+        # Suppress HDF5 plugin-path warnings that cause OSError in workers
+        os.environ.setdefault("HDF5_PLUGIN_PATH", "")
  
         # Open file to read metadata and build index
         with h5py.File(h5_path, "r") as f:
             self.ep_len = f["ep_len"][:]        # (num_episodes,)
             self.ep_offset = f["ep_offset"][:]  # (num_episodes,)
  
+            # Load actions fully into memory (float32, small relative to pixels)
+            self.actions = f["action"][:]        # (Total_Steps, A)
+ 
             # Read data shapes for validation
             pixels_shape = f["pixels"].shape  # (Total, H, W, C)
-            action_shape = f["action"].shape  # (Total, A)
             print(f"Loaded H5 dataset: {h5_path}")
             print(f"  Episodes: {len(self.ep_len)}")
             print(f"  Total steps: {pixels_shape[0]}")
             print(f"  Pixel shape: {pixels_shape[1:]}")
-            print(f"  Action dim: {action_shape[1]}")
+            print(f"  Action dim: {self.actions.shape[1]}")
+            print(f"  Actions loaded into memory: "
+                  f"{self.actions.nbytes / 1e6:.1f} MB")
  
         # Build index of valid (obs_t, a_t, obs_{t+1}) transitions
         # We must not cross episode boundaries
@@ -588,13 +604,41 @@ class LeWMH5Dataset(Dataset):
  
         print(f"  Valid transitions: {len(self.index)}")
  
-        # We keep the h5 file handle open for fast access during training.
-        # h5py supports concurrent reads from multiple workers IF we open
-        # the file in each worker (see __getitem__).
+        # Per-worker HDF5 handle — set to None here, opened in worker_init_fn
+        # or lazily in __getitem__ for num_workers=0
         self._h5 = None
  
+    def open_h5(self):
+        """Open (or re-open) the HDF5 file handle.
+ 
+        Called by worker_init_fn in each DataLoader worker so every
+        process has its own independent file descriptor.
+        """
+        import h5py
+        if self._h5 is not None:
+            try:
+                self._h5.close()
+            except Exception:
+                pass
+        self._h5 = h5py.File(self.h5_path, "r", swmr=True)
+ 
+    @staticmethod
+    def worker_init_fn(worker_id):
+        """DataLoader worker_init_fn — opens a fresh HDF5 handle per worker.
+ 
+        Usage:
+            loader = DataLoader(dataset, num_workers=4,
+                                worker_init_fn=LeWMH5Dataset.worker_init_fn)
+        """
+        import torch.utils.data as data
+        worker_info = data.get_worker_info()
+        if worker_info is not None:
+            dataset = worker_info.dataset
+            if isinstance(dataset, LeWMH5Dataset):
+                dataset.open_h5()
+ 
     def _get_h5(self):
-        """Lazy-open HDF5 file (needed for DataLoader num_workers > 0)."""
+        """Return the HDF5 handle, opening it if needed (num_workers=0 path)."""
         import h5py
         if self._h5 is None:
             self._h5 = h5py.File(self.h5_path, "r")
@@ -612,13 +656,13 @@ class LeWMH5Dataset(Dataset):
         obs_t = self._preprocess(f["pixels"][global_t])
         obs_next = self._preprocess(f["pixels"][t_next])
  
-        # Read action at time t
-        action = f["action"][global_t].astype(np.float32)
+        # Read action from in-memory array (no HDF5 access needed)
+        action = self.actions[global_t]
  
         return {
             "obs_t": obs_t,                               # (3, H, W) float32
             "obs_next": obs_next,                         # (3, H, W) float32
-            "action": torch.from_numpy(action),            # (A,)
+            "action": torch.from_numpy(action.copy()),     # (A,)
         }
  
     def _preprocess(self, img: np.ndarray) -> torch.Tensor:
@@ -635,6 +679,7 @@ class LeWMH5Dataset(Dataset):
             img = cv2.resize(img, (self.img_size, self.img_size),
                              interpolation=cv2.INTER_AREA)
         return torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
+
  
 
 if __name__ == "__main__":

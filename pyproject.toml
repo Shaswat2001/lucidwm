@@ -38,7 +38,9 @@ dependencies = [
     "cma",
     "swig",
     "gymnasium[box2d]",
-    "decord"
+    "decord",
+    "huggingface_hub",
+    "zstandard"
 ]
 
 [project.optional-dependencies]
