@@ -72,6 +72,7 @@ def parse_args():
     parser.add_argument("--env-id", type=str, default="walker-walk")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--track", action="store_true")
+    parser.add_argument("--eval", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="lucidwm")
     parser.add_argument("--eval-freq", type=int, default=2000)
     parser.add_argument("--eval-episodes", type=int, default=10)
@@ -128,7 +129,7 @@ class PWMModel(nn.Module):
         super(PWMModel, self).__init__()
 
         self.encoder = nn.Sequential(MLP(obs_dim, args.latent_dim, args.hidden_dim, activation=nn.Mish), SimNorm(args.simnorm_dim))
-        self.dynamics = nn.Sequential(MLP(args.latent_dim+action_dim, self.latent_dim, args.hidden_dim, activation=nn.Mish), SimNorm(args.simnorm_dim))
+        self.dynamics = nn.Sequential(MLP(args.latent_dim+action_dim, args.latent_dim, args.hidden_dim, activation=nn.Mish), SimNorm(args.simnorm_dim))
         self.rewards = MLP(args.latent_dim+action_dim, args.num_bins, args.hidden_dim, activation=nn.Mish)
         self.two_hot_distribution = TwoHotDist(num_bins=args.num_bins)
 
@@ -517,7 +518,6 @@ if __name__ == "__main__":
         action_dim = dataset.action_all.shape[-1]
 
         world_model = PWMModel(obs_dim, action_dim, args).to(device)
-        two_hot_distribution = 
         world_model = pretrain_world_model(world_model, dataset, args, device, logger)
 
         # Save
@@ -540,8 +540,8 @@ if __name__ == "__main__":
         action_dim = env.action_space.shape[0]
         env.close()
 
-    policy = PWMPolicy(action_dim).to(device)
-    critic = PWMCriticEnsemble(num_critics=args.num_critics).to(device)
+    policy = PWMPolicy(args, action_dim).to(device)
+    critic = PWMCriticEnsemble(args, num_critics=args.num_critics).to(device)
 
     policy_opt = optim.Adam(policy.parameters(), lr=args.policy_lr)
     critic_opt = optim.Adam(critic.parameters(), lr=args.critic_lr)

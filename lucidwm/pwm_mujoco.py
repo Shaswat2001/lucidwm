@@ -56,6 +56,7 @@ def parse_args():
                         help="Minari dataset ID to train on")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--track", action="store_true")
+    parser.add_argument("--eval", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="lucidwm")
     parser.add_argument("--eval-freq", type=int, default=2000)
     parser.add_argument("--eval-episodes", type=int, default=10)
@@ -102,10 +103,10 @@ def pretrain_world_model_minari(world_model, dataset, args, device, logger):
     H = args.wm_horizon
     seq_len = H + 1
 
-    print(f"Pre-training world model: {args.wm_steps} steps, H={H}, "
+    print(f"Pre-training world model: {args.wm_epochs} steps, H={H}, "
           f"batch={args.wm_batch_size}")
 
-    for step in range(args.wm_steps):
+    for step in range(args.wm_epochs):
         batch = dataset.sample(args.wm_batch_size, seq_len=seq_len)
         obs = torch.tensor(batch["obs"], dtype=torch.float32, device=device)
         action = torch.tensor(batch["action"], dtype=torch.float32, device=device)
@@ -132,8 +133,8 @@ def pretrain_world_model_minari(world_model, dataset, args, device, logger):
         nn.utils.clip_grad_norm_(world_model.parameters(), 20.0)
         optimizer.step()
 
-        if step % 1000 == 0:
-            print(f"  Step {step}/{args.wm_steps}  loss={total_loss.item():.4f}")
+        if step % 10 == 0:
+            print(f"  Step {step}/{args.wm_epochs}  loss={total_loss.item():.4f}")
             logger.log({"wm/loss": total_loss.item()}, step=step)
 
     return world_model
@@ -185,8 +186,8 @@ if __name__ == "__main__":
     # ── Phase 2: Policy Learning ─────────────────────────────────────
     print(f"\n{'='*60}\nPhase 2: FoG policy learning ({args.policy_steps} steps)\n{'='*60}")
 
-    policy = PWMPolicy(action_dim).to(device)
-    critic = PWMCriticEnsemble(num_critics=args.num_critics).to(device)
+    policy = PWMPolicy(args, action_dim).to(device)
+    critic = PWMCriticEnsemble(args, num_critics=args.num_critics).to(device)
     policy_opt = optim.Adam(policy.parameters(), lr=args.policy_lr)
     critic_opt = optim.Adam(critic.parameters(), lr=args.critic_lr)
 
