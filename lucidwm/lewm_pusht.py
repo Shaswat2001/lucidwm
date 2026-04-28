@@ -48,7 +48,6 @@ Compute: ~2-4 hours on single GPU
 """
 
 import os
-import math
 import argparse
 import subprocess
 import numpy as np
@@ -74,349 +73,363 @@ def parse_args():
     parser.add_argument("--logdir", type=str, default="exp/lewm")
 
     # Data
-    parser.add_argument("--data-path", type=str, default=None,
-                        help="Path to pusht_expert_train.h5. If not provided, "
-                             "downloads from HuggingFace automatically.")
-    parser.add_argument("--hf-repo", type=str, default="quentinll/lewm-pusht",
-                        help="HuggingFace dataset repo for auto-download")
-    parser.add_argument("--hf-filename", type=str, default="pusht_expert_train.h5.zst",
-                        help="Filename within the HF repo (zstd-compressed)")
-    parser.add_argument("--img-size", type=int, default=96)
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default=None,
+        help="Path to pusht_expert_train.h5. If not provided, downloads from HuggingFace automatically.",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        type=str,
+        default="quentinll/lewm-pusht",
+        help="HuggingFace dataset repo for auto-download",
+    )
+    parser.add_argument(
+        "--hf-filename",
+        type=str,
+        default="pusht_expert_train.h5.zst",
+        help="Filename within the HF repo (zstd-compressed)",
+    )
+    parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--frameskip", type=int, default=1)
 
     # Training
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--sigreg-lambda", type=float, default=0.1)
-    parser.add_argument("--sigreg-projections", type=int, default=512)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--latent-dim", type=int, default=192)
+    parser.add_argument("--history-size", type=int, default=3)
+    parser.add_argument("--sigreg-lambda", type=float, default=0.09)
+    parser.add_argument("--sigreg-projections", type=int, default=1024)
+    parser.add_argument("--sigreg-knots", type=int, default=17)
 
     # Encoder
-    parser.add_argument("--enc-patch-size", type=int, default=8)
+    parser.add_argument("--enc-patch-size", type=int, default=14)
     parser.add_argument("--enc-embed-dim", type=int, default=192)
     parser.add_argument("--enc-depth", type=int, default=12)
-    parser.add_argument("--enc-heads", type=int, default=96)
+    parser.add_argument("--enc-heads", type=int, default=3)
 
-    # Predictor
+    # Action encoder / predictor
+    parser.add_argument("--action-dim", type=int, default=2)
+    parser.add_argument("--action-smoothed-dim", type=int, default=16)
+    parser.add_argument("--action-emb-dim", type=int, default=192)
     parser.add_argument("--pred-dim", type=int, default=512)
     parser.add_argument("--pred-depth", type=int, default=6)
-    parser.add_argument("--pred-heads", type=int, default=8)
+    parser.add_argument("--pred-heads", type=int, default=16)
+    parser.add_argument("--pred-dim-head", type=int, default=64)
+    parser.add_argument("--pred-mlp-dim", type=int, default=2048)
     parser.add_argument("--pred-dropout", type=float, default=0.1)
+    parser.add_argument("--pred-emb-dropout", type=float, default=0.0)
 
     # Planning
     parser.add_argument("--plan-horizon", type=int, default=10)
     parser.add_argument("--cem-candidates", type=int, default=200)
     parser.add_argument("--cem-elites", type=int, default=20)
     parser.add_argument("--cem-iterations", type=int, default=10)
-    parser.add_argument("--action-dim", type=int, default=2)
 
     parser.add_argument("--skip-train", action="store_true")
-
     return parser.parse_args()
 
-# SIGReg
-def sigreg(z: torch.Tensor, M: int) -> torch.Tensor:
-    """
-    SIGReg: enforce isotropic Gaussian distribution on latent embeddings.
+class SIGReg(nn.Module):
+    """Sketch Isotropic Gaussian Regularizer from the official LeWM release."""
 
-    Uses the Cramer-Wold theorem: a distribution is Gaussian iff ALL its
-    1D projections are Gaussian. We sample M random directions, project z
-    onto each, and compute the Epps-Pulley test statistic measuring
-    departure from normality.
+    def __init__(self, knots: int = 17, num_proj: int = 1024):
+        super().__init__()
+        self.num_proj = num_proj
 
-    Args:
-        z: (B, D) latent embeddings (batch of CLS tokens)
-        M: number of random projection directions
+        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt = 3 / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        window = torch.exp(-t.square() / 2.0)
 
-    Returns:
-        scalar: mean Epps-Pulley statistic (lower = more Gaussian)
-    """
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
 
-    B, D = z.shape
-    device = z.device
+    def forward(self, proj: torch.Tensor) -> torch.Tensor:
+        """proj: (T, B, D)."""
+        a = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
+        a = a / (a.norm(p=2, dim=0, keepdim=True) + 1e-8)
 
-    # Random projection directions on unit sphere
-    directions = torch.randn(D, M, device=device)
-    directions = F.normalize(directions, dim=0)  # (D, M)
-
-    # Project: (B, D) @ (D, M) -> (B, M)
-    projections = z @ directions  # (B, M)
-
-    # Standardize each projection
-    projections = (projections - projections.mean(dim=0)) / (projections.std(dim=0) + 1e-8)
-
-    # Epps-Pulley test statistic for each projection
-    # EP(x) = (2/n) * sum_i sum_j exp(-||x_i - x_j||^2 / 2) - sqrt(2) * (2/n) * sum_i exp(-x_i^2 / 4) + 1/sqrt(3)
-    # Simplified batch version using pairwise distances
-    ep_stats = []
-    for m in range(M):
-        x = projections[:, m]  # (B,)
-
-        # Term 1: mean of exp(-|xi - xj|^2 / 2) over all pairs
-        diffs = x.unsqueeze(0) - x.unsqueeze(1)  # (B, B)
-        term1 = torch.exp(-0.5 * diffs.pow(2)).mean()
-
-        # Term 2: mean of exp(-xi^2 / 4)
-        term2 = torch.exp(-0.25 * x.pow(2)).mean()
-
-        ep = term1 - math.sqrt(2) * term2 + 1.0 / math.sqrt(3)
-        ep_stats.append(ep)
-
-    return torch.stack(ep_stats).mean()
-
-# Encoder: ViT-Tiny
+        x_t = (proj @ a).unsqueeze(-1) * self.t
+        err = (x_t.cos().mean(dim=-3) - self.phi).square() + x_t.sin().mean(dim=-3).square()
+        statistic = (err @ self.weights) * proj.size(-2)
+        return statistic.mean()
 
 class PatchEmbedding(nn.Module):
-    """Split image into patches and project to embedding dim."""
-
     def __init__(self, img_size: int, patch_size: int, embed_dim: int, in_channels: int = 3):
         super().__init__()
         self.num_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_channels, embed_dim,
-                              kernel_size=patch_size, stride=patch_size)
+        self.proj = nn.Conv2d(
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
 
-    def forward(self, x):
-        """(B, 3, H, W) -> (B, num_patches, embed_dim)."""
-        x = self.proj(x)                    # (B, E, H/P, W/P)
-        return x.flatten(2).transpose(1, 2)  # (B, N, E)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        return x.flatten(2).transpose(1, 2)
 
 class LeWMEncoder(nn.Module):
-    """
-    ViT-Tiny encoder with CLS token.
-
-    Image -> patch embedding -> ViT-Tiny (12 layers) -> CLS token.
-    Output is a raw CLS vector in R^embed_dim. The projection into
-    the embedding space is handled by a SEPARATE Projector module
-    (matching the repo architecture).
-    """
+    """Small ViT encoder producing a CLS token representation."""
 
     def __init__(self, args):
         super(LeWMEncoder, self).__init__()
-
         self.embed_dim = args.enc_embed_dim
         self.patch_embed = PatchEmbedding(args.img_size, args.enc_patch_size, args.enc_embed_dim, 3)
         num_patches = self.patch_embed.num_patches
 
-        # CLS token and position embeddings
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.02)
-        self.pos_embed = nn.Parameter(
-            torch.randn(1, 1 + num_patches, self.embed_dim) * 0.02
-        )
+        self.pos_embed = nn.Parameter(torch.randn(1, 1 + num_patches, self.embed_dim) * 0.02)
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=self.embed_dim, nhead=args.enc_heads,
-                dim_feedforward=self.embed_dim * 4,
-                activation="gelu", batch_first=True, norm_first=True,
-            )
-            for _ in range(args.enc_depth)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=self.embed_dim,
+                    nhead=args.enc_heads,
+                    dim_feedforward=self.embed_dim * 4,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+             
+                for _ in range(args.enc_depth)
+            ]
+        )
         self.norm = nn.LayerNorm(self.embed_dim)
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        """Encode image to CLS token vector.
-
-        Args: img (B, 3, H, W) in [0, 1]
-        Returns: z (B, embed_dim) -- raw CLS token, NOT projected
-        """
-        B = img.shape[0]
-        x = self.patch_embed(img)  # (B, N, E)
-
-        # Prepend CLS token
-        cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1)  # (B, 1+N, E)
-        x = x + self.pos_embed
-
+        b = img.shape[0]
+        x = self.patch_embed(img)
+        cls = self.cls_token.expand(b, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self.pos_embed[:, : x.shape[1]]
         for block in self.blocks:
             x = block(x)
         x = self.norm(x)
-
-        return x[:, 0]  # (B, embed_dim) -- CLS token
+        return x[:, 0]
 
 class Projector(nn.Module):
-    """MLP projection head with BatchNorm (matching repo).
-
-    Two separate projectors are used in LeWM:
-      1. Encoder projector: projects encoder CLS tokens into embedding space
-      2. Predictor projector: projects predictor outputs into the same space
-
-    The MSE prediction loss is computed between the outputs of these two
-    projectors, NOT between raw encoder/predictor outputs. This is a
-    standard JEPA pattern (also used in VICReg, Barlow Twins).
-
-    Args:
-        in_dim: input dimension
-        proj_dim: projection output dimension (embedding space)
-        hidden_dim: MLP hidden dimension
-    """
-
     def __init__(self, in_dim: int, proj_dim: int, hidden_dim: int | None = None):
         super().__init__()
         hidden_dim = hidden_dim or in_dim * 2
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, proj_dim),
             nn.BatchNorm1d(proj_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, in_dim) -> (B, proj_dim)."""
         return self.net(x)
-    
-class LeWMPredictor(nn.Module):
-    """Transformer predictor for next-latent prediction.
 
-    Takes current encoder output z_t and action a_t, predicts z_{t+1}.
-    Action is projected to pred_dim and treated as an additional token.
-    Dropout 0.1 throughout (critical for stability per paper).
+class ActionEncoder(nn.Module):
+    """Official-style action embedder with a 1x1 temporal smoothing conv."""
 
-    Output is in pred_dim space. The separate predictor Projector maps
-    this to the embedding space where MSE is computed.
-
-    Args:
-        embed_dim: encoder output dimension. Default: 192.
-        action_dim: action space dimension.
-        pred_dim: transformer hidden dim. Default: 512.
-        depth: transformer layers. Default: 6.
-        num_heads: attention heads. Default: 8.
-        dropout: dropout rate. Default: 0.1.
-    """
-
-    def __init__(self, args, action_dim=2):
+    def __init__(
+        self,
+        input_dim: int,
+        smoothed_dim: int,
+        emb_dim: int,
+        mlp_scale: int = 4,
+    ):
         super().__init__()
-        self.pred_dim = args.pred_dim
-        self.embed_dim = args.enc_embed_dim
+        self.patch_embed = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
+        self.embed = nn.Sequential(
+            nn.Linear(smoothed_dim, mlp_scale * emb_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_scale * emb_dim, emb_dim),
+        )
 
-        # Project encoder output and action to predictor dim
-        self.z_proj = nn.Linear(self.embed_dim, self.pred_dim)
-        self.a_proj = nn.Linear(action_dim, self.pred_dim)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float().permute(0, 2, 1)
+        x = self.patch_embed(x)
+        x = x.permute(0, 2, 1)
+        return self.embed(x)
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=self.pred_dim, nhead=args.pred_heads,
-                dim_feedforward=self.pred_dim * 4,
-                activation="gelu", batch_first=True, norm_first=True,
-                dropout=args.pred_dropout,
-            )
-            for _ in range(args.pred_depth)
-        ])
-        self.norm = nn.LayerNorm(self.pred_dim)
-        self.dropout = nn.Dropout(args.pred_dropout)
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x * (1 + scale) + shift
 
-        # Project back to embed_dim for chaining during planning
-        self.out_proj = nn.Linear(self.pred_dim, self.embed_dim)
+class FeedForward(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
 
-    def forward(self, z: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """Predict next latent.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
-        Args:
-            z: (B, embed_dim) encoder CLS token
-            action: (B, action_dim) current action
+class Attention(nn.Module):
+    def __init__(self, dim: int, heads: int = 8, dim_head: int = 64, dropout: float = 0.0):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        self.inner_dim = heads * dim_head
+        self.dropout = dropout
 
-        Returns:
-            z_pred: (B, embed_dim) predicted next latent (chainable)
-        """
-        z_tok = self.z_proj(z).unsqueeze(1)        # (B, 1, pred_dim)
-        a_tok = self.a_proj(action).unsqueeze(1)    # (B, 1, pred_dim)
-        x = torch.cat([z_tok, a_tok], dim=1)        # (B, 2, pred_dim)
+        self.norm = nn.LayerNorm(dim)
+        self.to_qkv = nn.Linear(dim, self.inner_dim * 3, bias=False)
+        self.to_out = nn.Sequential(
+            nn.Linear(self.inner_dim, dim),
+            nn.Dropout(dropout),
+        )
 
-        for block in self.blocks:
-            x = block(x)
+    def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
+        b, t, _ = x.shape
         x = self.norm(x)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = [
+            tensor.view(b, t, self.heads, self.dim_head).permute(0, 2, 1, 3)
+            for tensor in qkv
+        ]
+        drop = self.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        out = out.permute(0, 2, 1, 3).reshape(b, t, self.inner_dim)
+        return self.to_out(out)
 
-        out = self.dropout(x[:, 0])  # (B, pred_dim)
-        return self.out_proj(out)     # (B, embed_dim)
+class ConditionalBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, dim_head: int, mlp_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ada_ln = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True),
+        )
+        nn.init.zeros_(self.ada_ln[-1].weight)
+        nn.init.zeros_(self.ada_ln[-1].bias)
 
-    def forward_raw(self, z: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """Forward pass returning pred_dim output (for projector during training).
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.ada_ln(c).chunk(6, dim=-1)
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
 
-        Args:
-            z: (B, embed_dim)
-            action: (B, action_dim)
+class LeWMPredictor(nn.Module):
+    """Autoregressive predictor over a history window of projected embeddings."""
 
-        Returns:
-            (B, pred_dim) -- raw transformer output before out_proj
-        """
-        z_tok = self.z_proj(z).unsqueeze(1)
-        a_tok = self.a_proj(action).unsqueeze(1)
-        x = torch.cat([z_tok, a_tok], dim=1)
+    def __init__(self, args):
+        super().__init__()
+        self.num_frames = args.history_size
+        self.input_dim = args.latent_dim
+        self.hidden_dim = args.pred_dim
+        self.output_dim = args.pred_dim
 
-        for block in self.blocks:
-            x = block(x)
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_frames, self.input_dim) * 0.02)
+        self.emb_dropout = nn.Dropout(args.pred_emb_dropout)
+        self.input_proj = nn.Linear(self.input_dim, self.hidden_dim)
+        self.cond_proj = nn.Linear(args.action_emb_dim, self.hidden_dim)
+        self.layers = nn.ModuleList(
+            [
+                ConditionalBlock(
+                    dim=self.hidden_dim,
+                    heads=args.pred_heads,
+                    dim_head=args.pred_dim_head,
+                    mlp_dim=args.pred_mlp_dim,
+                    dropout=args.pred_dropout,
+                )
+                for _ in range(args.pred_depth)
+            ]
+        )
+        self.norm = nn.LayerNorm(self.hidden_dim)
+        self.output_proj = nn.Linear(self.hidden_dim, self.output_dim)
+
+    def forward(self, emb: torch.Tensor, act_emb: torch.Tensor) -> torch.Tensor:
+        t = emb.size(1)
+        x = emb + self.pos_embedding[:, :t]
+        x = self.emb_dropout(x)
+        x = self.input_proj(x)
+        c = self.cond_proj(act_emb)
+        for block in self.layers:
+            x = block(x, c)
         x = self.norm(x)
+        return self.output_proj(x)
 
-        return self.dropout(x[:, 0])  # (B, pred_dim)
-
-def train(encoder, predictor, enc_projector, pred_projector, dataset, args, device, logger):
-    """Train LeWM end-to-end with the two-term objective.
-
-    L = L_pred + lambda * SIGReg(Z_all)
-
-    Where:
-      L_pred = MSE(pred_projector(predictor(z_t, a_t)), enc_projector(encoder(o_{t+1})))
-      SIGReg is applied to ALL encoder embeddings in the batch (z_t AND z_{t+1})
-
-    Both encoder, predictor, and projectors are optimized jointly.
-    No stop-gradient, no EMA, no frozen parameters.
-    """
+def train(
+    encoder,
+    action_encoder,
+    predictor,
+    enc_projector,
+    pred_projector,
+    sigreg,
+    dataset,
+    args,
+    device,
+    logger,
+):
     has_gpu = torch.cuda.is_available()
     loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=4, pin_memory=has_gpu, drop_last=True,
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=has_gpu,
+        drop_last=True,
         worker_init_fn=LeWMH5Dataset.worker_init_fn,
         persistent_workers=True,
     )
-    
-    params = (list(encoder.parameters()) + list(predictor.parameters()) +
-              list(enc_projector.parameters()) + list(pred_projector.parameters()))
-    optimizer = optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
+
+    params = (
+        list(encoder.parameters())
+        + list(action_encoder.parameters())
+        + list(predictor.parameters())
+        + list(enc_projector.parameters())
+        + list(pred_projector.parameters())
+    )
+    optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     print(f"Training LeWM: {args.epochs} epochs, {len(dataset)} samples")
+    print(f"  History size: {args.history_size}")
     print(f"  Encoder: {sum(p.numel() for p in encoder.parameters())/1e6:.1f}M params")
+    print(f"  Action encoder: {sum(p.numel() for p in action_encoder.parameters())/1e3:.1f}K params")
     print(f"  Predictor: {sum(p.numel() for p in predictor.parameters())/1e6:.1f}M params")
     print(f"  Enc projector: {sum(p.numel() for p in enc_projector.parameters())/1e3:.1f}K params")
     print(f"  Pred projector: {sum(p.numel() for p in pred_projector.parameters())/1e3:.1f}K params")
-    print(f"  SIGReg lambda={args.sigreg_lambda}, projections={args.sigreg_projections}")
 
     step = 0
     for epoch in range(args.epochs):
         encoder.train()
+        action_encoder.train()
         predictor.train()
         enc_projector.train()
         pred_projector.train()
+
         epoch_pred_loss = 0.0
         epoch_sig_loss = 0.0
 
         for batch in loader:
-            obs_t = batch["obs_t"].to(device)          # (B, 3, H, W)
-            obs_next = batch["obs_next"].to(device)    # (B, 3, H, W)
-            action = batch["action"].to(device)         # (B, A)
+            obs = batch["obs"].to(device)          # (B, H+1, 3, img, img)
+            action = batch["action"].to(device)    # (B, H, A)
 
-            # Encode both frames (gradients flow through encoder)
-            z_t = encoder(obs_t)          # (B, embed_dim)
-            z_next = encoder(obs_next)    # (B, embed_dim)
+            bsz, seq_len, c, h_img, w_img = obs.shape
+            flat_obs = obs.reshape(bsz * seq_len, c, h_img, w_img)
 
-            # Predict next latent (raw pred_dim output for projector)
-            z_pred_raw = predictor.forward_raw(z_t, action)  # (B, pred_dim)
+            z_raw = encoder(flat_obs).reshape(bsz, seq_len, -1)
+            emb = enc_projector(z_raw.reshape(bsz * seq_len, -1)).reshape(bsz, seq_len, -1)
+            act_emb = action_encoder(action)
 
-            # Project both into embedding space for MSE comparison
-            z_next_proj = enc_projector(z_next)    # (B, proj_dim)
-            z_pred_proj = pred_projector(z_pred_raw)  # (B, proj_dim)
+            pred_raw = predictor(emb[:, :-1], act_emb)
+            pred = pred_projector(pred_raw.reshape(bsz * args.history_size, -1)).reshape(
+                bsz, args.history_size, -1
+            )
+            target = emb[:, 1:]
 
-            # L_pred: MSE in projected embedding space
-            pred_loss = F.mse_loss(z_pred_proj, z_next_proj)
-
-            # SIGReg: applied to FULL sequence of encoder embeddings
-            # Concatenate z_t and z_next to regularize all representations
-            z_all = torch.cat([z_t, z_next], dim=0)  # (2B, embed_dim)
-            sig_loss = sigreg(z_all, M=args.sigreg_projections)
-
-            # Total loss
+            pred_loss = F.mse_loss(pred, target)
+            sig_loss = sigreg(emb.transpose(0, 1))
             loss = pred_loss + args.sigreg_lambda * sig_loss
 
             optimizer.zero_grad()
@@ -433,35 +446,52 @@ def train(encoder, predictor, enc_projector, pred_projector, dataset, args, devi
         avg_sig = epoch_sig_loss / len(loader)
 
         if epoch % 10 == 0:
-            print(f"  Epoch {epoch}/{args.epochs}  pred={avg_pred:.6f}  "
-                  f"sigreg={avg_sig:.6f}  lr={scheduler.get_last_lr()[0]:.2e}")
+            print(
+                f"  Epoch {epoch}/{args.epochs}  pred={avg_pred:.6f}  "
+                f"sigreg={avg_sig:.6f}  lr={scheduler.get_last_lr()[0]:.2e}"
+            )
         logger.log({"train/pred_loss": avg_pred, "train/sigreg": avg_sig}, step=step)
 
-    return encoder, predictor, enc_projector, pred_projector
+    return encoder, action_encoder, predictor, enc_projector, pred_projector
 
 @torch.no_grad()
-def plan_cem(encoder, predictor, obs_current, goal_z,
-             action_dim, args, device):
-    """CEM planning in LeWM latent space.
+def plan_cem(
+    encoder,
+    action_encoder,
+    predictor,
+    enc_projector,
+    pred_projector,
+    obs_history,
+    goal_z,
+    action_dim,
+    args,
+    device,
+    action_history=None,
+):
+    """CEM planning using LeWM's history-conditioned autoregressive latent model."""
 
-    Cost = ||z_predicted_at_horizon - z_goal||^2.
-    Because each frame is a single 192-dim vector (not 256 patches),
-    this is ~48x faster than DINO-WM planning.
+    history_size = args.history_size
+    if obs_history.dim() == 3:
+        obs_history = obs_history.unsqueeze(0)
+    obs_history = obs_history.to(device)
 
-    Args:
-        encoder: trained LeWM encoder
-        predictor: trained LeWM predictor
-        obs_current: (3, H, W) current observation
-        goal_z: (latent_dim,) goal latent embedding
-        action_dim: action space dimension
-        args: planning hyperparameters
-        device: torch device
+    if obs_history.size(1) != history_size:
+        raise ValueError(f"obs_history must have exactly {history_size} frames")
 
-    Returns:
-        action: (A,) first action of best sequence
-    """
-    z = encoder(obs_current.unsqueeze(0).to(device))  # (1, D)
-    goal_z = goal_z.unsqueeze(0).to(device)            # (1, D)
+    bsz, hist_len, c, h_img, w_img = obs_history.shape
+    z_raw = encoder(obs_history.reshape(bsz * hist_len, c, h_img, w_img)).reshape(bsz, hist_len, -1)
+    emb_hist = enc_projector(z_raw.reshape(bsz * hist_len, -1)).reshape(bsz, hist_len, -1)
+
+    if action_history is None:
+        action_history = torch.zeros(bsz, history_size, action_dim, device=device)
+    else:
+        if action_history.dim() == 2:
+            action_history = action_history.unsqueeze(0)
+        action_history = action_history.to(device)
+        if action_history.size(1) != history_size:
+            raise ValueError(f"action_history must have exactly {history_size} actions")
+
+    goal_z = goal_z.unsqueeze(0).to(device) if goal_z.dim() == 1 else goal_z.to(device)
 
     horizon = args.plan_horizon
     n_cand = args.cem_candidates
@@ -471,18 +501,20 @@ def plan_cem(encoder, predictor, obs_current, goal_z,
     std = torch.ones(horizon, action_dim, device=device)
 
     for _ in range(args.cem_iterations):
-        actions = (mean + std * torch.randn(n_cand, horizon, action_dim, device=device))
+        actions = mean.unsqueeze(0) + std.unsqueeze(0) * torch.randn(n_cand, horizon, action_dim, device=device)
         actions = actions.clamp(-1, 1)
 
-        # Rollout each candidate
-        z_expanded = z.expand(n_cand, -1)  # (N, D)
+        emb_roll = emb_hist.expand(n_cand, -1, -1).clone()
+        act_roll = action_history.expand(n_cand, -1, -1).clone()
+
         for t in range(horizon):
-            z_expanded = predictor(z_expanded, actions[:, t])
+            act_emb = action_encoder(act_roll[:, -history_size:])
+            pred_raw = predictor(emb_roll[:, -history_size:], act_emb)
+            pred = pred_projector(pred_raw[:, -1])
+            emb_roll = torch.cat([emb_roll, pred.unsqueeze(1)], dim=1)
+            act_roll = torch.cat([act_roll, actions[:, t : t + 1]], dim=1)
 
-        # Cost: L2 to goal
-        costs = ((z_expanded - goal_z) ** 2).sum(dim=-1)  # (N,)
-
-        # Elites
+        costs = ((emb_roll[:, -1] - goal_z.expand(n_cand, -1)) ** 2).sum(dim=-1)
         elite_idx = costs.topk(n_elite, largest=False).indices
         elite_actions = actions[elite_idx]
         mean = elite_actions.mean(dim=0)
@@ -490,13 +522,8 @@ def plan_cem(encoder, predictor, obs_current, goal_z,
 
     return mean[0].cpu().numpy()
 
-# Downloading Dataset
 def download_h5_dataset(repo_id, filename, cache_dir="data"):
-    """Download and decompress the LeWM dataset from HuggingFace.
-
-    The file is zstd-compressed (.h5.zst). Downloads via huggingface_hub
-    and decompresses to produce a plain .h5 file.
-    """
+    """Download and decompress the LeWM dataset from HuggingFace."""
     from huggingface_hub import hf_hub_download
 
     os.makedirs(cache_dir, exist_ok=True)
@@ -510,108 +537,78 @@ def download_h5_dataset(repo_id, filename, cache_dir="data"):
 
     print(f"Downloading {filename} from {repo_id}...")
     downloaded = hf_hub_download(
-        repo_id=repo_id, filename=filename, repo_type="dataset",
+        repo_id=repo_id,
+        filename=filename,
+        repo_type="dataset",
         cache_dir=os.path.join(cache_dir, ".hf_cache"),
     )
 
     if filename.endswith(".zst"):
         print(f"Decompressing -> {h5_path}")
         try:
-            subprocess.run(["zstd", "-d", downloaded, "-o", h5_path],
-                           check=True, capture_output=True)
+            subprocess.run(["zstd", "-d", downloaded, "-o", h5_path], check=True, capture_output=True)
         except (FileNotFoundError, subprocess.CalledProcessError):
             import zstandard as zstd
+
             dctx = zstd.ZstdDecompressor()
             with open(downloaded, "rb") as ifh, open(h5_path, "wb") as ofh:
                 dctx.copy_stream(ifh, ofh)
         print(f"Decompressed: {h5_path}")
     else:
         import shutil
+
         shutil.copy2(downloaded, h5_path)
 
     return h5_path
 
 class LeWMH5Dataset(Dataset):
-    """Dataset loader for the official LeWM HDF5 format.
- 
-    The stable-worldmodel HDF5 layout stores all episodes concatenated:
-        pixels:    (Total_Steps, H, W, C) uint8
-        action:    (Total_Steps, Action_Dim) float32
-        ep_len:    (Num_Episodes,) int32    — length of each episode
-        ep_offset: (Num_Episodes,) int64    — start index of each episode
- 
-    This dataset yields (obs_t, action_t, obs_{t+1}) transition triples,
-    respecting episode boundaries so we never cross episodes.
- 
-    Args:
-        h5_path: path to the .h5 file
-        img_size: target image size (resized if needed)
-        frameskip: number of steps between obs_t and obs_{t+1}
-    """
- 
-    def __init__(self, h5_path: str, img_size: int = 96, frameskip: int = 1):
+    """Dataset loader that returns LeWM history windows."""
+
+    def __init__(self, h5_path: str, img_size: int = 224, frameskip: int = 1, history_size: int = 3):
         self._ensure_hdf5plugin()
         import h5py
-        
+
         self.h5_path = h5_path
         self.img_size = img_size
         self.frameskip = frameskip
+        self.history_size = history_size
 
-        # Read metadata and small arrays into memory
         with h5py.File(h5_path, "r") as f:
             self.ep_len = f["ep_len"][:]
             self.ep_offset = f["ep_offset"][:]
-            self.actions = f["action"][:]  # small, fits in RAM
+            self.actions = f["action"][:]
 
             pixels_shape = f["pixels"].shape
             self.stored_h, self.stored_w = pixels_shape[1], pixels_shape[2]
-
-            # Check what compression the pixels dataset uses
-            pix_dset = f["pixels"]
-            filter_ids = getattr(pix_dset, "filter_ids", ())
-            if filter_ids:
-                print(f"  Pixels compression filters: {filter_ids}")
-                print(f"  (hdf5plugin is {'loaded' if 'hdf5plugin' in dir() else 'NOT loaded'})")
 
             print(f"Loaded H5: {h5_path}")
             print(f"  Episodes: {len(self.ep_len)}, Total steps: {pixels_shape[0]}")
             print(f"  Pixels: {pixels_shape[1:]}, Actions: {self.actions.shape[1:]}")
 
-        # # Build index of valid transitions (respecting episode boundaries)
-        # self.index = []
-        # for ep_idx in range(len(self.ep_len)):
-        #     offset = int(self.ep_offset[ep_idx])
-        #     length = int(self.ep_len[ep_idx])
-        #     for t in range(length - frameskip):
-        #         self.index.append(offset + t)
-
-        # print(f"  Valid transitions: {len(self.index)}")
-
-        n_eps = len(self.ep_len) if 100 is None else min(100, len(self.ep_len))
         self.index = []
-        for ep_idx in range(n_eps):
+        stride = self.frameskip
+        max_offset = self.history_size * stride
+        for ep_idx in range(len(self.ep_len)):
             offset = int(self.ep_offset[ep_idx])
             length = int(self.ep_len[ep_idx])
-            for t in range(length - frameskip):
+            for t in range(length - max_offset):
                 self.index.append(offset + t)
 
-        print(f"  Using {n_eps}/{len(self.ep_len)} episodes, {len(self.index)} transitions")
-
-        # Per-worker HDF5 handle (set in worker_init_fn)
+        print(f"  Using all {len(self.ep_len)} episodes, {len(self.index)} history windows")
         self._h5 = None
 
     def _get_h5(self):
-        """Get HDF5 handle, opening if needed (num_workers=0 fallback)."""
         if self._h5 is None:
             self._ensure_hdf5plugin()
             import h5py
+
             self._h5 = h5py.File(self.h5_path, "r")
         return self._h5
 
     def open_h5(self):
-        """Open a fresh HDF5 handle. Called by worker_init_fn."""
         self._ensure_hdf5plugin()
         import h5py
+
         if self._h5 is not None:
             try:
                 self._h5.close()
@@ -621,8 +618,6 @@ class LeWMH5Dataset(Dataset):
 
     @staticmethod
     def _ensure_hdf5plugin():
-        """Ensure HDF5 plugin path is set and hdf5plugin filters are registered."""
-        import os
         os.environ.setdefault("HDF5_PLUGIN_PATH", "")
         try:
             import hdf5plugin  # noqa: F401
@@ -631,14 +626,13 @@ class LeWMH5Dataset(Dataset):
 
     @staticmethod
     def worker_init_fn(worker_id):
-        """DataLoader worker_init_fn: opens a per-worker HDF5 handle."""
-        import os
         os.environ.setdefault("HDF5_PLUGIN_PATH", "")
         try:
-            import hdf5plugin  # noqa: F401 -- must register in EACH worker process
+            import hdf5plugin  # noqa: F401
         except ImportError:
             pass
         import torch.utils.data as data
+
         worker_info = data.get_worker_info()
         if worker_info is not None:
             dataset = worker_info.dataset
@@ -651,25 +645,24 @@ class LeWMH5Dataset(Dataset):
     def __getitem__(self, idx):
         f = self._get_h5()
         global_t = self.index[idx]
-        t_next = global_t + self.frameskip
+        step = self.frameskip
 
-        # Read single frames from HDF5 (decompression handled by hdf5plugin)
-        obs_t = self._preprocess(f["pixels"][global_t])
-        obs_next = self._preprocess(f["pixels"][t_next])
-        action = self.actions[global_t]
+        frame_ids = [global_t + i * step for i in range(self.history_size + 1)]
+        action_ids = [global_t + i * step for i in range(self.history_size)]
+
+        obs = torch.stack([self._preprocess(f["pixels"][frame_id]) for frame_id in frame_ids], dim=0)
+        action = torch.from_numpy(self.actions[action_ids].copy()).float()
 
         return {
-            "obs_t": obs_t,
-            "obs_next": obs_next,
-            "action": torch.from_numpy(action.copy()),
+            "obs": obs,
+            "action": action,
         }
 
     def _preprocess(self, img):
-        """(H, W, C) uint8 -> (3, img_size, img_size) float32 in [0, 1]."""
         import cv2
+
         if img.shape[0] != self.img_size or img.shape[1] != self.img_size:
-            img = cv2.resize(img, (self.img_size, self.img_size),
-                             interpolation=cv2.INTER_AREA)
+            img = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA)
         return torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
 
 if __name__ == "__main__":
@@ -678,21 +671,22 @@ if __name__ == "__main__":
     device = get_device()
     Path(args.logdir).mkdir(parents=True, exist_ok=True)
 
-    logger = Logger(project=args.wandb_project, name=f"lewm_{args.env_id}_s{args.seed}",
-                    config=vars(args), use_wandb=args.track)
+    logger = Logger(
+        project=args.wandb_project,
+        name=f"lewm_{args.env_id}_s{args.seed}",
+        config=vars(args),
+        use_wandb=args.track,
+    )
 
-    # Build model components
     encoder = LeWMEncoder(args).to(device)
-    predictor = LeWMPredictor(args, action_dim=args.action_dim).to(device)
-
-    # Two separate projectors (matching repo architecture)
-    proj_dim = args.latent_dim  # embedding space dimension
-    enc_projector = Projector(encoder.embed_dim, proj_dim).to(device)
-    pred_projector = Projector(predictor.pred_dim, proj_dim).to(device)
+    action_encoder = ActionEncoder(input_dim=args.action_dim, smoothed_dim=args.action_smoothed_dim, emb_dim=args.action_emb_dim).to(device)
+    predictor = LeWMPredictor(args).to(device)
+    enc_projector = Projector(encoder.embed_dim, args.latent_dim).to(device)
+    pred_projector = Projector(args.pred_dim, args.latent_dim).to(device)
+    sigreg = SIGReg(knots=args.sigreg_knots, num_proj=args.sigreg_projections).to(device)
 
     if not args.skip_train:
         print(f"\n{'='*60}\nTraining LeWM\n{'='*60}")
-        # Resolve dataset path: use provided path or auto-download from HF
         if args.data_path is not None:
             h5_path = args.data_path
         else:
@@ -701,39 +695,51 @@ if __name__ == "__main__":
                 filename=args.hf_filename,
                 cache_dir=os.path.join(args.logdir, "data"),
             )
- 
+
         dataset = LeWMH5Dataset(
             h5_path=h5_path,
             img_size=args.img_size,
             frameskip=args.frameskip,
+            history_size=args.history_size,
         )
 
-        encoder, predictor, enc_projector, pred_projector = train(
-            encoder, predictor, enc_projector, pred_projector,
-            dataset, args, device, logger,
+        encoder, action_encoder, predictor, enc_projector, pred_projector = train(
+            encoder,
+            action_encoder,
+            predictor,
+            enc_projector,
+            pred_projector,
+            sigreg,
+            dataset,
+            args,
+            device,
+            logger,
         )
 
-        torch.save({
-            "encoder": encoder.state_dict(),
-            "predictor": predictor.state_dict(),
-            "enc_projector": enc_projector.state_dict(),
-            "pred_projector": pred_projector.state_dict(),
-        }, os.path.join(args.logdir, "lewm.pt"))
+        torch.save(
+            {
+                "encoder": encoder.state_dict(),
+                "action_encoder": action_encoder.state_dict(),
+                "predictor": predictor.state_dict(),
+                "enc_projector": enc_projector.state_dict(),
+                "pred_projector": pred_projector.state_dict(),
+            },
+            os.path.join(args.logdir, "lewm.pt"),
+        )
     else:
-        ckpt = torch.load(os.path.join(args.logdir, "lewm.pt"),
-                          map_location=device, weights_only=True)
+        ckpt = torch.load(os.path.join(args.logdir, "lewm.pt"), map_location=device, weights_only=True)
         encoder.load_state_dict(ckpt["encoder"])
+        action_encoder.load_state_dict(ckpt["action_encoder"])
         predictor.load_state_dict(ckpt["predictor"])
         enc_projector.load_state_dict(ckpt["enc_projector"])
         pred_projector.load_state_dict(ckpt["pred_projector"])
 
     total_params = sum(
         sum(p.numel() for p in m.parameters())
-        for m in [encoder, predictor, enc_projector, pred_projector]
+        for m in [encoder, action_encoder, predictor, enc_projector, pred_projector]
     )
-    print(f"\nLeWM trained. Total: {total_params/1e6:.1f}M params")
-    print("Use plan_cem() for CEM goal-reaching in latent space.")
-    print("Note: planning uses encoder directly (not projectors).")
+    print(f"\nLeWM ready. Total: {total_params/1e6:.1f}M params")
+    print("Use plan_cem() with obs_history and action_history for latent goal-reaching.")
 
     logger.close()
     print("Done.")
