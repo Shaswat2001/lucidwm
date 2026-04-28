@@ -5,7 +5,7 @@ Not algorithm logic -- just plumbing.
 """
 
 from lucidwm_utils.envs import make_env
-from lucidwm_utils.buffers import ReplayBuffer, PrioritizedReplayBuffer
+from lucidwm_utils.buffers import ReplayBuffer
 from lucidwm_utils.metrics import evaluate
 from lucidwm_utils.logger import Logger
 

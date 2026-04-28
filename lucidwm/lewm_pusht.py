@@ -49,7 +49,6 @@ Compute: ~2-4 hours on single GPU
 
 import os
 import math
-import h5py
 import argparse
 import subprocess
 import numpy as np
@@ -196,7 +195,7 @@ class LeWMEncoder(nn.Module):
         super(LeWMEncoder, self).__init__()
 
         self.embed_dim = args.enc_embed_dim
-        self.patch_embed = PatchEmbedding(args.img_size, args.enc_patch_size, 3, args.enc_embed_dim)
+        self.patch_embed = PatchEmbedding(args.img_size, args.enc_patch_size, args.enc_embed_dim, 3)
         num_patches = self.patch_embed.num_patches
 
         # CLS token and position embeddings
@@ -551,6 +550,9 @@ class LeWMH5Dataset(Dataset):
     """
  
     def __init__(self, h5_path: str, img_size: int = 96, frameskip: int = 1):
+        self._ensure_hdf5plugin()
+        import h5py
+        
         self.h5_path = h5_path
         self.img_size = img_size
         self.frameskip = frameskip
@@ -591,12 +593,14 @@ class LeWMH5Dataset(Dataset):
     def _get_h5(self):
         """Get HDF5 handle, opening if needed (num_workers=0 fallback)."""
         if self._h5 is None:
+            self._ensure_hdf5plugin()
             import h5py
             self._h5 = h5py.File(self.h5_path, "r")
         return self._h5
 
     def open_h5(self):
         """Open a fresh HDF5 handle. Called by worker_init_fn."""
+        self._ensure_hdf5plugin()
         import h5py
         if self._h5 is not None:
             try:
@@ -606,8 +610,24 @@ class LeWMH5Dataset(Dataset):
         self._h5 = h5py.File(self.h5_path, "r")
 
     @staticmethod
+    def _ensure_hdf5plugin():
+        """Ensure HDF5 plugin path is set and hdf5plugin filters are registered."""
+        import os
+        os.environ.setdefault("HDF5_PLUGIN_PATH", "")
+        try:
+            import hdf5plugin  # noqa: F401
+        except ImportError:
+            pass
+
+    @staticmethod
     def worker_init_fn(worker_id):
         """DataLoader worker_init_fn: opens a per-worker HDF5 handle."""
+        import os
+        os.environ.setdefault("HDF5_PLUGIN_PATH", "")
+        try:
+            import hdf5plugin  # noqa: F401 -- must register in EACH worker process
+        except ImportError:
+            pass
         import torch.utils.data as data
         worker_info = data.get_worker_info()
         if worker_info is not None:
