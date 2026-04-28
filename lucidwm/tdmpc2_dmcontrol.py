@@ -60,6 +60,9 @@ from lucidwm_utils.metrics import evaluate
 from lucidwm_utils.buffers import ReplayBuffer
 from lucidwm_utils.misc import get_device, set_seed
 
+from lucidwm_components.networks import MLP
+from lucidwm_components.distribution import SimNorm
+
 def parse_args():
     parser = argparse.ArgumentParser(description="LucidWM: TD-MPC2")
 
@@ -88,6 +91,8 @@ def parse_args():
     parser.add_argument("--num-bins", type=int, default=101)
     parser.add_argument("--num-q", type=int, default=5)
     parser.add_argument("--simnorm-dim", type=int, default=8)
+    parser.add_argument("--simnorm-temp", type=float, default=0.5)
+
     parser.add_argument("--mppi-n", type=int, default=512)
     parser.add_argument("--mppi-iter", type=int, default=6)
     parser.add_argument("--mppi-temp", type=float, default=0.5)
@@ -105,50 +110,7 @@ def parse_args():
                         help="Batch size for offline training (paper uses 1024)")
     
     return parser.parse_args()
-
-# SimNorm
-class SimNorm(nn.Module):
-    """Simplicial Normalization (SimNorm).
-
-    Partitions the latent vector into groups of `dim` elements and applies
-    softmax to each group independently. This projects each group onto a
-    probability simplex, enforcing sparse, bounded representations.
-
-    Prevents latent blowup that plagues implicit world models.
-
-    Args:
-        dim: Group size. Default: 8 (SIMNORM_DIM).
-    """
-
-    def __init__(self, dim):
-        super(SimNorm, self).__init__()
-        self.dim = dim
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (..., D) where D is divisible by self.dim."""
-        shape = x.shape
-        x = x.view(*x.shape[:-1], -1, self.dim)
-        x = F.softmax(x, dim=-1)
-        return x.view(*shape)
-    
-# MLP block
-def mlp(in_dim, out_dim, hidden_dim, num_layers=2):
-    """MLP with LayerNorm + Mish activation (TD-MPC2 style).
-
-    Every hidden layer: Linear -> LayerNorm -> Mish.
-    Output layer: bare Linear (no activation).
-
-    Returns: nn.Sequential
-    """
-    layers = []
-    dims = [in_dim] + [hidden_dim] * num_layers + [out_dim]
-    for i in range(len(dims) - 1):
-        layers.append(nn.Linear(dims[i], dims[i+1]))
-        if i < len(dims) - 2:
-            layers.append(nn.LayerNorm(dims[i + 1]))
-            layers.append(nn.Mish())
-    return nn.Sequential(*layers)
-
 # Discrete Regression (log-spaced bins)
 def two_hot_encode(x: torch.Tensor, num_bins: int) -> torch.Tensor:
     """Encode scalar into two-hot vector over log-spaced bins.
@@ -209,23 +171,23 @@ class TDMPC2Model(nn.Module):
         self.action_dim = action_dim
 
         self.encoder = nn.Sequential(
-            mlp(self.obs_dim, args.latent_dim, args.hidden_dim),
-            SimNorm(args.simnorm_dim)
+            MLP(self.obs_dim, args.latent_dim, args.hidden_dim, activation=nn.Mish),
+            SimNorm(args.simnorm_dim, args.simnorm_temp)
         )
 
         self.dynamics = nn.Sequential(
-            mlp(args.latent_dim + action_dim, args.latent_dim, args.hidden_dim),
-            SimNorm(args.simnorm_dim)
+            MLP(args.latent_dim + action_dim, args.latent_dim, args.hidden_dim, activation=nn.Mish),
+            SimNorm(args.simnorm_dim, args.simnorm_temp)
         )
 
-        self.rewards = mlp(args.latent_dim + action_dim, args.num_bins, args.hidden_dim)
+        self.rewards = MLP(args.latent_dim + action_dim, args.num_bins, args.hidden_dim, activation=nn.Mish)
 
-        self.termination = mlp(args.latent_dim + action_dim, 1, args.hidden_dim)
+        self.termination = MLP(args.latent_dim + action_dim, 1, args.hidden_dim, activation=nn.Mish)
 
-        self.policy_prior = mlp(args.latent_dim, 2 * action_dim, args.hidden_dim)
+        self.policy_prior = MLP(args.latent_dim, 2 * action_dim, args.hidden_dim, activation=nn.Mish)
 
         self.q = nn.ModuleList([
-            mlp(args.latent_dim + action_dim, args.num_bins, args.hidden_dim) for _ in range(args.num_q)
+            MLP(args.latent_dim + action_dim, args.num_bins, args.hidden_dim, activation=nn.Mish) for _ in range(args.num_q)
         ])
 
     @staticmethod

@@ -13,14 +13,15 @@ import torch.nn.functional as F
 class SimNorm(nn.Module):
     """Simplicial normalization. Groups of V elements -> softmax each group."""
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, temp: float = 1.0):
         super(SimNorm, self).__init__()
         self.dim = dim
+        self.temp = temp
     
     def forward(self, x: torch.Tensor):
         shape = x.shape
         x = x.view(*x.shape[:-1], -1, self.dim)
-        x = F.softmax(x, dim=-1)
+        x = F.softmax(x / self.temp, dim=-1)
         return x.view(*shape)
 
 

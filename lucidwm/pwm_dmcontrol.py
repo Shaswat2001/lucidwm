@@ -92,6 +92,7 @@ def parse_args():
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--num-bins", type=int, default=101)
     parser.add_argument("--simnorm-dim", type=int, default=8)
+    parser.add_argument("--simnorm-temp", type=float, default=0.5)
 
     # Policy learning (phase 2)
     parser.add_argument("--policy-steps", type=int, default=10_000,
@@ -128,8 +129,8 @@ class PWMModel(nn.Module):
     def __init__(self, obs_dim: int, action_dim: int, args):
         super(PWMModel, self).__init__()
 
-        self.encoder = nn.Sequential(MLP(obs_dim, args.latent_dim, args.hidden_dim, activation=nn.Mish), SimNorm(args.simnorm_dim))
-        self.dynamics = nn.Sequential(MLP(args.latent_dim+action_dim, args.latent_dim, args.hidden_dim, activation=nn.Mish), SimNorm(args.simnorm_dim))
+        self.encoder = nn.Sequential(MLP(obs_dim, args.latent_dim, args.hidden_dim, activation=nn.Mish), SimNorm(args.simnorm_dim, args.simnorm_temp))
+        self.dynamics = nn.Sequential(MLP(args.latent_dim+action_dim, args.latent_dim, args.hidden_dim, activation=nn.Mish), SimNorm(args.simnorm_dim, args.simnorm_temp))
         self.rewards = MLP(args.latent_dim+action_dim, args.num_bins, args.hidden_dim, activation=nn.Mish)
         self.two_hot_distribution = TwoHotDist(num_bins=args.num_bins)
 

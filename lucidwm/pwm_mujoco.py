@@ -76,6 +76,7 @@ def parse_args():
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--num-bins", type=int, default=101)
     parser.add_argument("--simnorm-dim", type=int, default=8)
+    parser.add_argument("--simnorm-temp", type=float, default=0.5)
 
     # Policy learning (phase 2)
     parser.add_argument("--policy-steps", type=int, default=10_000,

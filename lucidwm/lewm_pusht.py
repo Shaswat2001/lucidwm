@@ -577,15 +577,25 @@ class LeWMH5Dataset(Dataset):
             print(f"  Episodes: {len(self.ep_len)}, Total steps: {pixels_shape[0]}")
             print(f"  Pixels: {pixels_shape[1:]}, Actions: {self.actions.shape[1:]}")
 
-        # Build index of valid transitions (respecting episode boundaries)
+        # # Build index of valid transitions (respecting episode boundaries)
+        # self.index = []
+        # for ep_idx in range(len(self.ep_len)):
+        #     offset = int(self.ep_offset[ep_idx])
+        #     length = int(self.ep_len[ep_idx])
+        #     for t in range(length - frameskip):
+        #         self.index.append(offset + t)
+
+        # print(f"  Valid transitions: {len(self.index)}")
+
+        n_eps = len(self.ep_len) if 100 is None else min(100, len(self.ep_len))
         self.index = []
-        for ep_idx in range(len(self.ep_len)):
+        for ep_idx in range(n_eps):
             offset = int(self.ep_offset[ep_idx])
             length = int(self.ep_len[ep_idx])
             for t in range(length - frameskip):
                 self.index.append(offset + t)
 
-        print(f"  Valid transitions: {len(self.index)}")
+        print(f"  Using {n_eps}/{len(self.ep_len)} episodes, {len(self.index)} transitions")
 
         # Per-worker HDF5 handle (set in worker_init_fn)
         self._h5 = None
