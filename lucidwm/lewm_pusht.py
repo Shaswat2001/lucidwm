@@ -49,6 +49,7 @@ Compute: ~2-4 hours on single GPU
 
 import os
 import math
+import h5py
 import argparse
 import subprocess
 import numpy as np
@@ -364,10 +365,12 @@ def train(encoder, predictor, enc_projector, pred_projector, dataset, args, devi
     No stop-gradient, no EMA, no frozen parameters.
     """
     has_gpu = torch.cuda.is_available()
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                        num_workers=4, pin_memory=has_gpu, drop_last=True,
-                        worker_init_fn=LeWMH5Dataset.worker_init_fn,
-                        persistent_workers=True)
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=4, pin_memory=has_gpu, drop_last=True,
+        worker_init_fn=LeWMH5Dataset.worker_init_fn,
+        persistent_workers=True,
+    )
     
     params = (list(encoder.parameters()) + list(predictor.parameters()) +
               list(enc_projector.parameters()) + list(pred_projector.parameters()))
@@ -489,61 +492,44 @@ def plan_cem(encoder, predictor, obs_current, goal_z,
     return mean[0].cpu().numpy()
 
 # Downloading Dataset
-def download_h5_dataset(repo_id: str, filename: str, cache_dir: str = "data") -> str:
-    """Download the official LeWM dataset from HuggingFace.
- 
-    The file on HF is zstd-compressed (.h5.zst). We download it and
-    decompress to produce a plain .h5 file.
- 
-    Args:
-        repo_id: HuggingFace dataset repo, e.g. "quentinll/lewm-pusht"
-        filename: file within the repo, e.g. "pusht_expert_train.h5.zst"
-        cache_dir: local directory to store the downloaded/decompressed file
- 
-    Returns:
-        Path to the decompressed .h5 file
+def download_h5_dataset(repo_id, filename, cache_dir="data"):
+    """Download and decompress the LeWM dataset from HuggingFace.
+
+    The file is zstd-compressed (.h5.zst). Downloads via huggingface_hub
+    and decompresses to produce a plain .h5 file.
     """
     from huggingface_hub import hf_hub_download
- 
+
     os.makedirs(cache_dir, exist_ok=True)
- 
-    # Determine output path for the decompressed file
-    if filename.endswith(".zst"):
-        h5_name = filename[:-4]  # strip .zst
-    else:
-        h5_name = filename
+
+    h5_name = filename[:-4] if filename.endswith(".zst") else filename
     h5_path = os.path.join(cache_dir, h5_name)
- 
+
     if os.path.exists(h5_path):
-        print(f"Dataset already exists at {h5_path}")
+        print(f"Dataset already cached: {h5_path}")
         return h5_path
- 
+
     print(f"Downloading {filename} from {repo_id}...")
     downloaded = hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        repo_type="dataset",
+        repo_id=repo_id, filename=filename, repo_type="dataset",
         cache_dir=os.path.join(cache_dir, ".hf_cache"),
     )
- 
+
     if filename.endswith(".zst"):
-        print(f"Decompressing {downloaded} -> {h5_path}")
-        # Use zstd to decompress (also available via python-zstandard)
+        print(f"Decompressing -> {h5_path}")
         try:
             subprocess.run(["zstd", "-d", downloaded, "-o", h5_path],
                            check=True, capture_output=True)
         except (FileNotFoundError, subprocess.CalledProcessError):
-            # Fallback: use python zstandard library
             import zstandard as zstd
             dctx = zstd.ZstdDecompressor()
             with open(downloaded, "rb") as ifh, open(h5_path, "wb") as ofh:
                 dctx.copy_stream(ifh, ofh)
-        print(f"Decompressed to {h5_path}")
+        print(f"Decompressed: {h5_path}")
     else:
-        # No compression, just symlink or copy
         import shutil
         shutil.copy2(downloaded, h5_path)
- 
+
     return h5_path
 
 class LeWMH5Dataset(Dataset):
@@ -565,122 +551,96 @@ class LeWMH5Dataset(Dataset):
     """
  
     def __init__(self, h5_path: str, img_size: int = 96, frameskip: int = 1):
-        import h5py
- 
         self.h5_path = h5_path
         self.img_size = img_size
         self.frameskip = frameskip
 
-        # Suppress HDF5 plugin-path warnings that cause OSError in workers
-        os.environ.setdefault("HDF5_PLUGIN_PATH", "")
- 
-        # Open file to read metadata and build index
+        # Read metadata and small arrays into memory
         with h5py.File(h5_path, "r") as f:
-            self.ep_len = f["ep_len"][:]        # (num_episodes,)
-            self.ep_offset = f["ep_offset"][:]  # (num_episodes,)
- 
-            # Load actions fully into memory (float32, small relative to pixels)
-            self.actions = f["action"][:]        # (Total_Steps, A)
- 
-            # Read data shapes for validation
-            pixels_shape = f["pixels"].shape  # (Total, H, W, C)
-            print(f"Loaded H5 dataset: {h5_path}")
-            print(f"  Episodes: {len(self.ep_len)}")
-            print(f"  Total steps: {pixels_shape[0]}")
-            print(f"  Pixel shape: {pixels_shape[1:]}")
-            print(f"  Action dim: {self.actions.shape[1]}")
-            print(f"  Actions loaded into memory: "
-                  f"{self.actions.nbytes / 1e6:.1f} MB")
- 
-        # Build index of valid (obs_t, a_t, obs_{t+1}) transitions
-        # We must not cross episode boundaries
+            self.ep_len = f["ep_len"][:]
+            self.ep_offset = f["ep_offset"][:]
+            self.actions = f["action"][:]  # small, fits in RAM
+
+            pixels_shape = f["pixels"].shape
+            self.stored_h, self.stored_w = pixels_shape[1], pixels_shape[2]
+
+            # Check what compression the pixels dataset uses
+            pix_dset = f["pixels"]
+            filter_ids = getattr(pix_dset, "filter_ids", ())
+            if filter_ids:
+                print(f"  Pixels compression filters: {filter_ids}")
+                print(f"  (hdf5plugin is {'loaded' if 'hdf5plugin' in dir() else 'NOT loaded'})")
+
+            print(f"Loaded H5: {h5_path}")
+            print(f"  Episodes: {len(self.ep_len)}, Total steps: {pixels_shape[0]}")
+            print(f"  Pixels: {pixels_shape[1:]}, Actions: {self.actions.shape[1:]}")
+
+        # Build index of valid transitions (respecting episode boundaries)
         self.index = []
         for ep_idx in range(len(self.ep_len)):
             offset = int(self.ep_offset[ep_idx])
             length = int(self.ep_len[ep_idx])
-            # Valid start positions: can take step at `t` and observe at `t + frameskip`
             for t in range(length - frameskip):
                 self.index.append(offset + t)
- 
+
         print(f"  Valid transitions: {len(self.index)}")
- 
-        # Per-worker HDF5 handle — set to None here, opened in worker_init_fn
-        # or lazily in __getitem__ for num_workers=0
+
+        # Per-worker HDF5 handle (set in worker_init_fn)
         self._h5 = None
- 
+
+    def _get_h5(self):
+        """Get HDF5 handle, opening if needed (num_workers=0 fallback)."""
+        if self._h5 is None:
+            import h5py
+            self._h5 = h5py.File(self.h5_path, "r")
+        return self._h5
+
     def open_h5(self):
-        """Open (or re-open) the HDF5 file handle.
- 
-        Called by worker_init_fn in each DataLoader worker so every
-        process has its own independent file descriptor.
-        """
+        """Open a fresh HDF5 handle. Called by worker_init_fn."""
         import h5py
         if self._h5 is not None:
             try:
                 self._h5.close()
             except Exception:
                 pass
-        self._h5 = h5py.File(self.h5_path, "r", swmr=True)
- 
+        self._h5 = h5py.File(self.h5_path, "r")
+
     @staticmethod
     def worker_init_fn(worker_id):
-        """DataLoader worker_init_fn — opens a fresh HDF5 handle per worker.
- 
-        Usage:
-            loader = DataLoader(dataset, num_workers=4,
-                                worker_init_fn=LeWMH5Dataset.worker_init_fn)
-        """
+        """DataLoader worker_init_fn: opens a per-worker HDF5 handle."""
         import torch.utils.data as data
         worker_info = data.get_worker_info()
         if worker_info is not None:
             dataset = worker_info.dataset
             if isinstance(dataset, LeWMH5Dataset):
                 dataset.open_h5()
- 
-    def _get_h5(self):
-        """Return the HDF5 handle, opening it if needed (num_workers=0 path)."""
-        import h5py
-        if self._h5 is None:
-            self._h5 = h5py.File(self.h5_path, "r")
-        return self._h5
- 
+
     def __len__(self):
         return len(self.index)
- 
+
     def __getitem__(self, idx):
         f = self._get_h5()
         global_t = self.index[idx]
         t_next = global_t + self.frameskip
- 
-        # Read pixel observations — stored as (H, W, C) uint8
+
+        # Read single frames from HDF5 (decompression handled by hdf5plugin)
         obs_t = self._preprocess(f["pixels"][global_t])
         obs_next = self._preprocess(f["pixels"][t_next])
- 
-        # Read action from in-memory array (no HDF5 access needed)
         action = self.actions[global_t]
- 
+
         return {
-            "obs_t": obs_t,                               # (3, H, W) float32
-            "obs_next": obs_next,                         # (3, H, W) float32
-            "action": torch.from_numpy(action.copy()),     # (A,)
+            "obs_t": obs_t,
+            "obs_next": obs_next,
+            "action": torch.from_numpy(action.copy()),
         }
- 
-    def _preprocess(self, img: np.ndarray) -> torch.Tensor:
-        """Preprocess a single image: resize + normalize to [0, 1].
- 
-        Args:
-            img: (H, W, C) uint8 array
- 
-        Returns:
-            (3, img_size, img_size) float32 tensor in [0, 1]
-        """
+
+    def _preprocess(self, img):
+        """(H, W, C) uint8 -> (3, img_size, img_size) float32 in [0, 1]."""
         import cv2
         if img.shape[0] != self.img_size or img.shape[1] != self.img_size:
             img = cv2.resize(img, (self.img_size, self.img_size),
                              interpolation=cv2.INTER_AREA)
         return torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
-
- 
 
 if __name__ == "__main__":
     args = parse_args()

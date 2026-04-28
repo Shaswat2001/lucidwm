@@ -40,7 +40,8 @@ dependencies = [
     "gymnasium[box2d]",
     "decord",
     "huggingface_hub",
-    "zstandard"
+    "zstandard",
+    "hdf5plugin"
 ]
 
 [project.optional-dependencies]
