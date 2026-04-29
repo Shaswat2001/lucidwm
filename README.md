@@ -1,40 +1,40 @@
 # LucidWM
 
-**Single-file implementations of world model algorithms.**
+**Single-file educational implementations of world model algorithms.**
 
 Every world model paper ships its own codebase with its own conventions. Dreamer is JAX with OmegaConf. TD-MPC2 is PyTorch with a different layout. DINO-WM uses Hydra. LeWM is something else entirely. If you want to understand how any of these algorithms actually work, you're fighting config systems and module graphs before you get to the algorithm.
 
-LucidWM puts each algorithm in one Python file. You read one file, you understand the whole thing. All implementations are PyTorch, use the same CLI, the same logging, the same evaluation protocol.
+LucidWM puts each algorithm in one Python file. You read one file, you understand the whole thing. All implementations are PyTorch and share a similar style, but some are more faithful than others and several include practical simplifications compared to the original papers and repos.
 
 ## Implemented Algorithms
 
 | Algorithm | File | Family | What It Does |
 |-----------|------|--------|-------------|
-| World Models | `wm_carracing.py` | VAE+RNN | VAE + MDN-RNN + CMA-ES controller in dream |
-| TD-MPC2 | `tdmpc2_dmc.py` | Implicit | No decoder. SimNorm latent + MPPI planning. Online + offline (HuggingFace) |
-| PWM | `pwm_dmc.py` | Implicit | Same WM as TD-MPC2, but learns policy via first-order gradients through frozen dynamics |
+| World Models | `wm_carracing.py` | VAE+RNN | VAE + MDN-RNN + CMA-ES controller, with a simplified training pipeline |
+| TD-MPC2 | `tdmpc2_dmcontrol.py` | Implicit | No decoder. SimNorm latent + MPPI planning. Online + offline (HuggingFace) |
+| PWM | `pwm_dmcontrol.py` | Implicit | Same WM as TD-MPC2, but learns policy via first-order gradients through frozen dynamics |
 | PWM (MuJoCo) | `pwm_mujoco.py` | Implicit | PWM trained on Minari offline datasets (HalfCheetah, Hopper, Ant, etc.) |
 | DINO-WM | `dinowm_pusht.py` | JEPA | Frozen DINOv2 backbone + causal ViT dynamics. Zero-shot goal planning |
-| LeWM | `lewm_pusht.py` | JEPA | Learned ViT-Tiny encoder + SIGReg. Two loss terms. ~15M params, single GPU |
+| LeWM | `lewm_pusht.py` | JEPA | Learned encoder + history-conditioned predictor + SIGReg. Faithful where practical |
 
 ## Architecture
 
 ```
 lucidwm_components/     Layer 1: Reusable building blocks
 ├── networks.py            ConvEncoder, ConvDecoder, MLP, ResidualBlock
-└── distributions.py       symlog, TwoHotDist, PercentileNormalizer, lambda_returns
+└── distribution.py        symlog, symexp, SimNorm, TwoHotDist
 
 lucidwm/                Layer 2: Single-file algorithms
 ├── wm_carracing.py        651 LOC, fully implemented
-├── tdmpc2_dmc.py          970 LOC, fully implemented (online + offline)
-├── pwm_dmc.py             734 LOC, fully implemented
-├── pwm_mujoco.py          373 LOC, fully implemented (Minari datasets)
-├── dinowm_pusht.py        634 LOC, fully implemented
-├── lewm_pusht.py          580 LOC, fully implemented
+├── tdmpc2_dmcontrol.py    TD-MPC2-style implementation (online + offline)
+├── pwm_dmcontrol.py       PWM-style implementation
+├── pwm_mujoco.py          PWM on Minari datasets
+├── dinowm_pusht.py        DINO-WM-style implementation
+├── lewm_pusht.py          LeWM-style implementation
 
 lucidwm_utils/          Layer 3: Shared infrastructure
 ├── envs.py               make_env() with state/pixel support for DMC, Atari, MuJoCo
-├── buffers.py             ReplayBuffer, PrioritizedReplayBuffer
+├── buffers.py             ReplayBuffer
 ├── metrics.py             Standardized evaluation protocol
 ├── logger.py              W&B + TensorBoard
 └── video.py               Video recording
@@ -61,13 +61,13 @@ pip install "lucidwm[all]"                 # Everything
 python -m lucidwm.wm_carracing --seed 1
 
 # TD-MPC2: online training on DMControl
-python -m lucidwm.tdmpc2_dmc --env-id walker-walk --seed 1 --track
+python -m lucidwm.tdmpc2_dmcontrol --env-id walker-walk --seed 1 --track
 
 # TD-MPC2: offline training on released datasets
-python -m lucidwm.tdmpc2_dmc --offline --dataset mt30
+python -m lucidwm.tdmpc2_dmcontrol --offline --dataset mt30
 
 # PWM: learn policy via FoG through frozen world model
-python -m lucidwm.pwm_dmc --dataset mt30 --env-id walker-walk
+python -m lucidwm.pwm_dmcontrol --dataset mt30 --env-id walker-walk
 
 # PWM on MuJoCo via Minari
 python -m lucidwm.pwm_mujoco --dataset mujoco/halfcheetah/medium-v0 --eval
@@ -76,8 +76,14 @@ python -m lucidwm.pwm_mujoco --dataset mujoco/halfcheetah/medium-v0 --eval
 python -m lucidwm.dinowm_pusht --data-dir ./data/pusht --action-dim 2
 
 # LeWM: end-to-end JEPA from pixels
-python -m lucidwm.lewm_pusht --data-dir ./data/pusht --action-dim 2
+python -m lucidwm.lewm_pusht --data-path ./data/pusht_expert_train.h5 --action-dim 2
 ```
+
+## Fidelity
+
+These are single-file educational implementations, not exact ports of the original repos.
+Some algorithms are close to the published method, while others intentionally simplify data loading,
+training structure, or planning to keep the code readable in one file.
 
 ## What's Covered
 
