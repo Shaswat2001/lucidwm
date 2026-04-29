@@ -9,6 +9,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def symlog(x):
+	"""
+	Symmetric logarithmic function.
+	Adapted from https://github.com/danijar/dreamerv3.
+	"""
+	return torch.sign(x) * torch.log(1 + torch.abs(x))
+
+def symexp(x):
+	"""
+	Symmetric exponential function.
+	Adapted from https://github.com/danijar/dreamerv3.
+	"""
+	return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+
 # SimNorm
 class SimNorm(nn.Module):
     """Simplicial normalization. Groups of V elements -> softmax each group."""
@@ -33,6 +47,8 @@ class TwoHotDist:
     The value is encoded by placing weight on the two nearest bins
     proportional to the distance.
 
+    Adapted from https://github.com/nicklashansen/tdmpc2.
+
     Args:
         num_bins: Number of bins. Default: 255.
         low: Lower bound of bin range. Default: -20.0.
@@ -42,7 +58,6 @@ class TwoHotDist:
         self.num_bins = num_bins
         self.low = low
         self.high = high
-        self.bins = torch.linspace(low, high, num_bins)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode scalar values as two-hot vectors.
@@ -53,24 +68,23 @@ class TwoHotDist:
         Returns:
             two_hot: (..., num_bins) two-hot encoded targets
         """
-        bins = self.bins.to(x.device)
-        x = x.clamp(self.low, self.high)
 
-        # Find the two nearest bins
-        below = torch.bucketize(x, bins) - 1
-        below = below.clamp(0, self.num_bins - 2)
-        above = below + 1
+        if self.num_bins == 0:
+            return x
+        elif self.num_bins == 1:
+            return symlog(x)
 
-        # Compute weights (linear interpolation)
-        below_val = bins[below]
-        above_val = bins[above]
-        weight_above = (x - below_val) / (above_val - below_val + 1e-8)
-        weight_below = 1.0 - weight_above
+        x = torch.clamp(symlog(x), self.low, self.high)
+
+        # Find the nearest bin and weights
+        below = torch.floor((x - self.low) / self.num_bins)
+        above = (below + 1) % self.num_bins
+        bin_offset = ((x - self.low) / self.num_bins - below).unsqueeze(-1)
 
         # Build two-hot
         two_hot = torch.zeros(*x.shape, self.num_bins, device=x.device)
-        two_hot.scatter_(-1, below.unsqueeze(-1), weight_below.unsqueeze(-1))
-        two_hot.scatter_(-1, above.unsqueeze(-1), weight_above.unsqueeze(-1))
+        two_hot.scatter_(-1, below.unsqueeze(-1), 1 - bin_offset)
+        two_hot.scatter_(-1, above.unsqueeze(-1), bin_offset)
 
         return two_hot
 
@@ -83,6 +97,11 @@ class TwoHotDist:
         Returns:
             values: (...) decoded scalar values
         """
-        bins = self.bins.to(logits.device)
-        probs = F.softmax(logits, dim=-1)
-        return (probs * bins).sum(dim=-1)
+        if self.num_bins == 0:
+            return logits
+        elif self.num_bins == 1:
+            return symexp(logits)
+        dreg_bins = torch.linspace(self.low, self.high, self.num_bins, device=logits.device, dtype=logits.dtype)
+        logits = F.softmax(logits, dim=-1)
+        logits = torch.sum(logits * dreg_bins, dim=-1, keepdim=True)
+        return symexp(logits)

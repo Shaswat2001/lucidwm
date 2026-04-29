@@ -61,7 +61,7 @@ from lucidwm_utils.buffers import ReplayBuffer
 from lucidwm_utils.misc import get_device, set_seed
 
 from lucidwm_components.networks import MLP
-from lucidwm_components.distribution import SimNorm
+from lucidwm_components.distribution import SimNorm, symlog, symexp
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LucidWM: TD-MPC2")
@@ -86,6 +86,8 @@ def parse_args():
     parser.add_argument("--utd", type=int, default=1, help="Update-to-data ratio")
     parser.add_argument("--entropy-coef", type=float, default=1e-4, help="SAC entropy coefficient")
     parser.add_argument("--rho", type=float, default=0.5, help="Consistency loss weight")
+    parser.add_argument("--policy-rho", type=float, default=0.5,
+                        help="Temporal weighting for policy loss over latent rollout states")
     parser.add_argument("--latent-dim", type=int, default=512)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--num-bins", type=int, default=101)
@@ -125,7 +127,7 @@ def two_hot_encode(x: torch.Tensor, num_bins: int) -> torch.Tensor:
         (..., num_bins) two-hot encoded
     """
     bins = symlog_bins(num_bins, x.device)
-    x = x.clamp(bins[0], bins[-1])
+    x = symlog(x).clamp(bins[0], bins[-1])
     below = torch.bucketize(x, bins) - 1
     below = below.clamp(0, num_bins - 2)
     above = below + 1
@@ -146,7 +148,7 @@ def decode_bins(logits: torch.Tensor, num_bins: int) -> torch.Tensor:
     """
     bins = symlog_bins(num_bins, logits.device)
     probs = F.softmax(logits, dim=-1)
-    return (probs * bins).sum(dim=-1)
+    return symexp((probs * bins).sum(dim=-1))
 
 def symlog_bins(num_bins: int, device: torch.device) -> torch.Tensor:
     """Generate log-spaced symmetric bins in [-20, 20]."""
@@ -356,6 +358,7 @@ class OfflineDataset:
         self.action_data = []
         self.reward_data = []
         self.task_data = []
+        self.done_data = []
 
         for chunk_path in chunk_files:
             print(f"  Loading {chunk_path.name}...")
@@ -369,11 +372,21 @@ class OfflineDataset:
                     obs = chunk.get("obs", chunk.get("observation", None))
                     act = chunk.get("action", None)
                     rew = chunk.get("reward", None)
+                    done = chunk.get("done", None)
+                    if done is None:
+                        done = chunk.get("terminated", None)
+                    if done is None:
+                        done = chunk.get("termination", None)
                     task = chunk.get("task", None)
                 elif isinstance(chunk, dict):
                     obs = chunk.get("obs", chunk.get("observation", None))
                     act = chunk.get("action", None)
                     rew = chunk.get("reward", None)
+                    done = chunk.get("done", None)
+                    if done is None:
+                        done = chunk.get("terminated", None)
+                    if done is None:
+                        done = chunk.get("termination", None)
                     task = chunk.get("task", None)
                 else:
                     print(f"  Warning: unknown chunk format in {chunk_path.name}, skipping")
@@ -390,11 +403,19 @@ class OfflineDataset:
                     act = act.numpy()
                 if isinstance(rew, torch.Tensor):
                     rew = rew.numpy()
+                if isinstance(done, torch.Tensor):
+                    done = done.numpy()
+                if isinstance(task, torch.Tensor):
+                    task = task.numpy()
 
                 self.obs_data.append(obs)
                 self.action_data.append(act)
                 if rew is not None:
                     self.reward_data.append(rew)
+                if done is not None:
+                    self.done_data.append(done.astype(np.float32))
+                if task is not None:
+                    self.task_data.append(task)
 
             except Exception as e:
                 print(f"  Warning: failed to load {chunk_path.name}: {e}")
@@ -407,14 +428,52 @@ class OfflineDataset:
         self.obs_all = np.concatenate(self.obs_data, axis=0)
         self.action_all = np.concatenate(self.action_data, axis=0)
         self.reward_all = np.concatenate(self.reward_data, axis=0) if self.reward_data else None
+        self.done_all = np.concatenate(self.done_data, axis=0) if self.done_data else None
+        self.task_all = np.concatenate(self.task_data, axis=0) if self.task_data else None
+
+        if self.task_filter is not None and self.task_all is not None:
+            task_mask = self.task_mask(self.task_filter)
+            if task_mask.any():
+                self.obs_all = self.obs_all[task_mask]
+                self.action_all = self.action_all[task_mask]
+                if self.reward_all is not None:
+                    self.reward_all = self.reward_all[task_mask]
+                if self.done_all is not None:
+                    self.done_all = self.done_all[task_mask]
+                self.task_all = self.task_all[task_mask]
+            else:
+                print(f"Warning: task filter '{self.task_filter}' matched no transitions; using full dataset.")
+
+        self.valid_starts = self.build_valid_starts()
 
         self.total_transitions = len(self.obs_all)
         print(f"Loaded {self.total_transitions:,} transitions "
               f"(obs: {self.obs_all.shape}, action: {self.action_all.shape})")
 
         # Free individual chunks
-        del self.obs_data, self.action_data, self.reward_data
+        del self.obs_data, self.action_data, self.reward_data, self.done_data, self.task_data
         self.chunks = None
+
+    def task_mask(self, task_filter: str) -> np.ndarray:
+        task_values = self.task_all
+        if task_values.dtype.kind in {"U", "S", "O"}:
+            normalized = np.array([str(t) for t in task_values])
+            return normalized == task_filter
+
+        # Some TD-MPC2 chunks store integer task IDs; in that case we can't
+        # infer a string mapping locally, so leave the dataset unfiltered.
+        return np.ones(len(task_values), dtype=bool)
+
+    def build_valid_starts(self) -> np.ndarray:
+        if self.done_all is None:
+            return np.arange(max(0, self.total_transitions - 1), dtype=np.int64)
+
+        done = self.done_all.astype(bool).reshape(-1)
+        valid = np.ones_like(done, dtype=bool)
+        # Don't allow a sampled window to start on the terminal transition.
+        valid[-1] = False
+        valid[:-1] &= ~done[:-1]
+        return np.flatnonzero(valid)
 
     def sample(self, batch_size: int, seq_len: int = 2) -> dict[str, np.ndarray]:
         """Sample random transitions for training.
@@ -429,8 +488,17 @@ class OfflineDataset:
         Returns:
             dict with obs (B, T, O), action (B, T, A), reward (B, T), done (B, T)
         """
-        max_start = self.total_transitions - seq_len
-        starts = np.random.randint(0, max_start, size=batch_size)
+        valid_starts = self.valid_starts[self.valid_starts <= self.total_transitions - seq_len]
+        if self.done_all is not None:
+            done_flat = self.done_all.astype(bool).reshape(-1)
+            valid_starts = np.array(
+                [s for s in valid_starts if not done_flat[s : s + seq_len - 1].any()],
+                dtype=np.int64,
+            )
+        if len(valid_starts) == 0:
+            raise ValueError(f"No valid starts for sequence length {seq_len}")
+
+        starts = np.random.choice(valid_starts, size=batch_size)
 
         obs_batch = np.stack([self.obs_all[s:s + seq_len] for s in starts])
         action_batch = np.stack([self.action_all[s:s + seq_len] for s in starts])
@@ -440,7 +508,10 @@ class OfflineDataset:
         else:
             reward_batch = np.zeros((batch_size, seq_len), dtype=np.float32)
 
-        done_batch = np.zeros((batch_size, seq_len), dtype=np.float32)
+        if self.done_all is not None:
+            done_batch = np.stack([self.done_all[s:s + seq_len] for s in starts]).astype(np.float32)
+        else:
+            done_batch = np.zeros((batch_size, seq_len), dtype=np.float32)
 
         return {
             "obs": obs_batch.astype(np.float32),
@@ -569,6 +640,8 @@ def update(
     consistency_loss_sum = 0.0
     reward_loss_sum = 0.0
     value_loss_sum = 0.0
+    cont_loss_sum = 0.0
+    policy_states: list[torch.Tensor] = [z.detach()]
 
     for t in range(H):
         a_t = action[:, t]
@@ -589,6 +662,13 @@ def update(
         total_loss = total_loss + reward_loss
         reward_loss_sum += reward_loss.item()
 
+        # ── Continue / termination loss ───────────────────────────────
+        cont_logits = model.cont(z, a_t).squeeze(-1)
+        cont_target = 1.0 - done[:, t]
+        cont_loss = F.binary_cross_entropy_with_logits(cont_logits, cont_target)
+        total_loss = total_loss + cont_loss
+        cont_loss_sum += cont_loss.item()
+
         # ── Q-value loss (TD target from target model) ────────────────
         with torch.no_grad():
             # Next state encoding from target
@@ -608,25 +688,30 @@ def update(
         # Loss for each Q-head
         q_logits_all = model.q_values(z.detach(), a_t)
         td_target_encoded = two_hot_encode(td_target, args.num_bins)
+        q_loss_sum = 0.0
         for q_logits in q_logits_all:
             q_loss = -(td_target_encoded * F.log_softmax(q_logits, dim=-1)).sum(-1).mean()
             total_loss = total_loss + q_loss / args.num_q
-        value_loss_sum += q_loss.item()
+            q_loss_sum += q_loss.item()
+        value_loss_sum += q_loss_sum / args.num_q
 
         # Advance latent state (use predicted, not re-encoded)
         z = z_pred
+        policy_states.append(z.detach())
 
     # ── Policy loss (SAC max entropy) ─────────────────────────────────
-    # Detach latent to prevent gradients flowing through world model
-    z_policy = model.encode(obs[:, 0]).detach()
-    a_pi, log_prob = model.policy(z_policy)
-    q_logits_all = model.q_values(z_policy, a_pi)
-    # Use min of 2 random Q-heads for policy update
-    idx = torch.randperm(args.num_q)[:2]
-    q1 = decode_bins(q_logits_all[idx[0]], args.num_bins)
-    q2 = decode_bins(q_logits_all[idx[1]], args.num_bins)
-    q_min = torch.min(q1, q2)
-    policy_loss = (args.entropy_coef * log_prob - q_min).mean()
+    policy_loss = torch.tensor(0.0, device=device)
+    rho_norm = sum(args.policy_rho ** t for t in range(len(policy_states)))
+    for t, z_policy in enumerate(policy_states):
+        a_pi, log_prob = model.policy(z_policy)
+        q_logits_all = model.q_values(z_policy, a_pi)
+        idx = torch.randperm(args.num_q)[:2]
+        q1 = decode_bins(q_logits_all[idx[0]], args.num_bins)
+        q2 = decode_bins(q_logits_all[idx[1]], args.num_bins)
+        q_min = torch.min(q1, q2)
+        step_loss = (args.entropy_coef * log_prob - q_min).mean()
+        policy_loss = policy_loss + (args.policy_rho ** t) * step_loss
+    policy_loss = policy_loss / rho_norm
     total_loss = total_loss + policy_loss
 
     # Backprop
@@ -644,6 +729,7 @@ def update(
         "losses/total": total_loss.item(),
         "losses/consistency": consistency_loss_sum / H,
         "losses/reward": reward_loss_sum / H,
+        "losses/continue": cont_loss_sum / H,
         "losses/value": value_loss_sum / H,
         "losses/policy": policy_loss.item(),
     }
