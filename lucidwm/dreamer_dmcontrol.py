@@ -213,6 +213,16 @@ class RSSM(nn.Module):
         std = F.softplus(std) + 0.1
         stoch = Normal(mean, std).rsample()
         return RSSMState(mean=mean, std=std, stoch=stoch, deter=deter)
+    
+    def obs_step(
+        self,
+        prev_state: RSSMState,
+        prev_action: torch.Tensor,
+        embed: torch.Tensor,
+    ) -> tuple[RSSMState, RSSMState]:
+        prior = self.calculate_prior(prev_state, prev_action)
+        post = self.calculate_posterior(prior, embed)
+        return post, prior
 
     def observe(
         self,
@@ -229,8 +239,7 @@ class RSSM(nn.Module):
 
         prev_state = state
         for t in range(horizon):
-            prior = self.calculate_prior(prev_state, actions[:, t])
-            post = self.calculate_posterior(prior, embeds[:, t])
+            post, prior = self.obs_step(prev_state, actions[:, t], embeds[:, t])
             posts.append(post)
             priors.append(prior)
             prev_state = post
@@ -360,7 +369,7 @@ def imagine_rollout(
     for _ in range(args.imagine_horizon):
         feat = model.rssm.get_feat(state)
         action, _ = model.actor.sample(feat.detach(), deterministic=False)
-        state = model.rssm.img_step(state, action)
+        state = model.rssm.calculate_prior(state, action)
         feat = model.rssm.get_feat(state)
         feats.append(feat)
         rewards.append(model.reward(feat).squeeze(-1))
@@ -513,7 +522,7 @@ def act(
     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
     embed = model.encoder(obs_t)
     if prev_state is None:
-        prev_state = model.rssm.initial(1, device)
+        prev_state = model.rssm.init_state(1, device)
     if prev_action is None:
         prev_action = torch.zeros(1, model.action_dim, device=device)
 
