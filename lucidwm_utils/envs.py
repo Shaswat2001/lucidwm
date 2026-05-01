@@ -6,9 +6,9 @@ Algorithms needing non-standard wrappers override in their single file.
 
 from __future__ import annotations
 
-
-import numpy as np
 import gymnasium as gym
+import numpy as np
+
 
 # Wrappers
 class ActionRepeatWrapper(gym.Wrapper):
@@ -29,6 +29,26 @@ class ActionRepeatWrapper(gym.Wrapper):
             if terminated or truncated:
                 break
         return obs, total_reward, terminated, truncated, info
+
+
+class TimeLimitWrapper(gym.Wrapper):
+    """Stop an episode after a fixed number of agent steps."""
+
+    def __init__(self, env: gym.Env, max_episode_steps: int):
+        super().__init__(env)
+        self.max_episode_steps = max_episode_steps
+        self._elapsed_steps = 0
+
+    def reset(self, **kwargs):
+        self._elapsed_steps = 0
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._elapsed_steps += 1
+        if self._elapsed_steps >= self.max_episode_steps:
+            truncated = True
+        return obs, reward, terminated, truncated, info
 
 class ResizeObservation(gym.ObservationWrapper):
     """Resize image observations to (size, size)."""
@@ -139,9 +159,11 @@ class FlattenDMCObservation(gym.ObservationWrapper):
 def make_env(
     env_id: str,
     seed: int = 0,
+    obs: str | None = None,
     img_size: int = 64,
     action_repeat: int | None = None,
     frame_stack: int | None = None,
+    time_limit: int | None = None,
 ) -> gym.Env:
     """Create environment with standard wrapper stack.
 
@@ -159,9 +181,12 @@ def make_env(
             Crafter: "crafter-reward-v1".
             MetaWorld: Task name, e.g., "reach-v2".
         seed: Random seed.
+        obs: Observation mode for suites that support multiple views.
+             DMControl: "state" or "rgb". None = suite default.
         img_size: Image observation size. Default: 64.
         action_repeat: Override default action repeat. None = use suite default.
         frame_stack: Override default frame stack. None = use suite default.
+        time_limit: Override episode length in environment steps where supported.
 
     Returns:
         Wrapped gymnasium environment.
@@ -169,7 +194,14 @@ def make_env(
     suite = _detect_suite(env_id)
 
     if suite == "dmc":
-        env = _make_dmc(env_id, seed, img_size, action_repeat or 2)
+        env = _make_dmc(
+            env_id,
+            seed,
+            obs=obs or "state",
+            img_size=img_size,
+            action_repeat=action_repeat or 2,
+            time_limit=time_limit,
+        )
     elif suite == "atari":
         env = _make_atari(env_id, seed, img_size, frame_stack or 4)
     elif suite == "crafter":
@@ -203,8 +235,12 @@ def _detect_suite(env_id: str) -> str:
     return "gym"
 
 def _make_dmc(
-    env_id: str, seed: int, obs: str = "state",
-    img_size: int = 64, action_repeat: int = 2,
+    env_id: str,
+    seed: int,
+    obs: str = "state",
+    img_size: int = 64,
+    action_repeat: int = 2,
+    time_limit: int | None = None,
 ) -> gym.Env:
     """Create DMControl environment with state or pixel observations.
 
@@ -214,6 +250,7 @@ def _make_dmc(
         obs: "state" for flat proprioceptive vector, "rgb" for pixel images
         img_size: pixel obs resolution (only used when obs="rgb")
         action_repeat: action repeat factor
+        time_limit: optional episode length in environment steps
 
     State mode wrapper stack:
         DmControlCompatibilityV0 -> FlattenDMCObservation -> ActionRepeat -> NormalizeActions
@@ -223,8 +260,8 @@ def _make_dmc(
     """
     domain, task = env_id.split("-", 1)
 
-    from shimmy import DmControlCompatibilityV0
     import dm_control.suite as suite
+    from shimmy import DmControlCompatibilityV0
 
     dm_env = suite.load(domain, task, task_kwargs={"random": seed})
     env = DmControlCompatibilityV0(dm_env, render_mode="rgb_array")
@@ -236,6 +273,8 @@ def _make_dmc(
 
     env = ActionRepeatWrapper(env, repeat=action_repeat)
     env = NormalizeActions(env)
+    if time_limit is not None:
+        env = TimeLimitWrapper(env, max_episode_steps=time_limit // action_repeat)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     return env
 
