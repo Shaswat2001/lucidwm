@@ -122,6 +122,9 @@ def set_requires_grad(modules: list[nn.Module], requires_grad: bool):
         for param in module.parameters():
             param.requires_grad_(requires_grad)
 
+def preprocess_obs(obs: torch.Tensor) -> torch.Tensor:
+    return obs - 0.5
+
 class DenseDecoder(nn.Module):
     """State decoder for vector-observation Dreamer."""
 
@@ -143,6 +146,7 @@ class DenseDecoder(nn.Module):
             hidden_dim=hidden_size,
             num_layers=num_layers,
             activation=nn.ELU,
+            norm=False
         )
 
     def forward(self, x: torch.Tensor):
@@ -386,7 +390,7 @@ def preprocess_batch(batch: dict[str, np.ndarray], device: torch.device) -> dict
     reward = torch.tensor(batch["reward"], dtype=torch.float32, device=device)
     done = torch.tensor(batch["done"], dtype=torch.float32, device=device)
     return {
-        "obs": obs,
+        "obs": preprocess_obs(obs),
         "action": action,
         "reward": reward,
         "done": done,
@@ -549,8 +553,16 @@ def train_step(
     batch_t = preprocess_batch(batch, device)
 
     model_opt.zero_grad(set_to_none=True)
+    actor_opt.zero_grad(set_to_none=True)
+    value_opt.zero_grad(set_to_none=True)
+
     model_loss, post, wm_metrics = world_model_loss(model, batch_t, args)
+    actor_loss, value_loss, behavior_metrics = behavior_losses(model, post, args)
+
     model_loss.backward()
+    actor_loss.backward()
+    value_loss.backward()
+
     model_grad = torch.nn.utils.clip_grad_norm_(
         list(model.encoder.parameters())
         + list(model.rssm.parameters())
@@ -559,18 +571,11 @@ def train_step(
         + ([] if model.cont is None else list(model.cont.parameters())),
         args.grad_clip,
     )
-    model_opt.step()
-
-    actor_opt.zero_grad(set_to_none=True)
-    actor_loss, value_loss, behavior_metrics = behavior_losses(model, post, args)
-    actor_loss.backward()
     actor_grad = torch.nn.utils.clip_grad_norm_(model.actor.parameters(), args.grad_clip)
-    actor_opt.step()
-
-    value_opt.zero_grad(set_to_none=True)
-    _, value_loss, _ = behavior_losses(model, post, args)
-    value_loss.backward()
     value_grad = torch.nn.utils.clip_grad_norm_(model.value.parameters(), args.grad_clip)
+
+    model_opt.step()
+    actor_opt.step()
     value_opt.step()
 
     metrics = dict(wm_metrics)
@@ -591,7 +596,7 @@ def act(
     expl_amount: float,
 ) -> tuple[np.ndarray, RSSMState, torch.Tensor]:
     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-    embed = model.encoder(obs_t)
+    embed = model.encoder(preprocess_obs(obs_t))
     if prev_state is None:
         prev_state = model.rssm.init_state(1, device)
     if prev_action is None:
