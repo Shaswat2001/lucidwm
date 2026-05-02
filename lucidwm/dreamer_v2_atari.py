@@ -1,26 +1,21 @@
-"""LucidWM: Dreamer V1 on DMControl
+"""LucidWM: DreamerV2 on Atari
 
-Paper:     "Dream to Control: Learning Behaviors by Latent Imagination"
-           (Hafner et al., ICLR 2020)
-Reference: https://github.com/danijar/dreamer
+Paper:     "Mastering Atari with Discrete World Models" (Hafner et al., 2021)
+Reference: https://danijar.com/project/dreamerv2/
 
-Faithful ingredients from the paper and official implementation:
-  - Pixel observations from DeepMind Control Suite (64x64 RGB)
-  - Gaussian RSSM with stochastic + deterministic latent state
-  - Conv encoder / deconv decoder world model
-  - Reconstruction, reward, KL, and optional continuation losses
-  - Imagination actor-critic trained with lambda-returns in latent space
+Key DreamerV2 changes relative to Dreamer V1:
+  - Categorical latent states with straight-through gradients
+  - KL balancing instead of free nats
+  - Discrete-action actor trained with reinforce-style gradients
+  - Policy entropy regularization for exploration
+  - Larger model defaults for Atari
 
-Repo adaptation:
-  - Single-file PyTorch implementation
-  - Reuses LucidWM replay buffer, logger, and evaluation helpers
-  - Uses Gymnasium + shimmy wrappers for DMControl compatibility
-
-Example:
-  python -m lucidwm.dreamer_dmcontrol --env-id walker-walk --seed 1 --track
+This file keeps the single-file LucidWM style while adapting the core
+algorithmic pieces to Atari.
 """
 
-import math
+from __future__ import annotations
+
 import argparse
 import numpy as np
 from dataclasses import dataclass
@@ -38,11 +33,11 @@ from lucidwm_utils.logger import Logger
 from lucidwm_utils.misc import get_device, set_seed
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="LucidWM: Dreamer V1 on DMControl")
+    parser = argparse.ArgumentParser(description="LucidWM: DreamerV2 on Atari")
 
-    parser.add_argument("--env-id", type=str, default="walker-walk")
+    parser.add_argument("--env-id", type=str, default="ALE/Pong-v5")
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--total-steps", type=int, default=1_000_000)
+    parser.add_argument("--total-steps", type=int, default=500_000)
     parser.add_argument("--prefill-steps", type=int, default=5_000)
     parser.add_argument("--eval-freq", type=int, default=10_000)
     parser.add_argument("--eval-episodes", type=int, default=10)
@@ -50,67 +45,59 @@ def parse_args():
     parser.add_argument("--wandb-project", type=str, default="lucidwm")
 
     parser.add_argument("--img-size", type=int, default=64)
-    parser.add_argument("--action-repeat", type=int, default=2)
-    parser.add_argument("--time-limit", type=int, default=1_000)
+    parser.add_argument("--frame-stack", type=int, default=4)
 
     parser.add_argument("--buffer-size", type=int, default=500_000)
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--batch-length", type=int, default=50)
     parser.add_argument("--train-every", type=int, default=1_000)
     parser.add_argument("--train-steps", type=int, default=100)
-    parser.add_argument("--model-lr", type=float, default=6e-4)
-    parser.add_argument("--actor-lr", type=float, default=8e-5)
-    parser.add_argument("--value-lr", type=float, default=8e-5)
+    parser.add_argument("--model-lr", type=float, default=2e-4)
+    parser.add_argument("--actor-lr", type=float, default=4e-5)
+    parser.add_argument("--value-lr", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=100.0)
 
-    parser.add_argument("--stoch-size", type=int, default=30)
-    parser.add_argument("--deter-size", type=int, default=200)
-    parser.add_argument("--rssm-hidden-size", type=int, default=200)
-    parser.add_argument("--num-units", type=int, default=400)
-    parser.add_argument("--cnn-depth", type=int, default=32)
-    parser.add_argument("--free-nats", type=float, default=3.0)
-    parser.add_argument("--kl-scale", type=float, default=1.0)
-    parser.add_argument("--pcont-scale", type=float, default=10.0)
+    parser.add_argument("--stoch-size", type=int, default=32)
+    parser.add_argument("--stoch-classes", type=int, default=32)
+    parser.add_argument("--deter-size", type=int, default=600)
+    parser.add_argument("--rssm-hidden-size", type=int, default=600)
+    parser.add_argument("--num-units", type=int, default=600)
+    parser.add_argument("--cnn-depth", type=int, default=48)
 
-    parser.add_argument("--discount", type=float, default=0.99)
+    parser.add_argument("--discount", type=float, default=0.999)
     parser.add_argument("--lambda-return", type=float, default=0.95)
     parser.add_argument("--imagine-horizon", type=int, default=15)
-    parser.add_argument("--action-init-std", type=float, default=5.0)
-    parser.add_argument("--min-std", type=float, default=1e-4)
-    parser.add_argument("--mean-scale", type=float, default=5.0)
-    parser.add_argument("--expl-amount", type=float, default=0.3)
-    parser.add_argument("--eval-noise", type=float, default=0.0)
-
+    parser.add_argument("--kl-scale", type=float, default=1.0)
+    parser.add_argument("--kl-balance", type=float, default=0.8)
+    parser.add_argument("--pcont-scale", type=float, default=10.0)
+    parser.add_argument("--actor-entropy-scale", type=float, default=1e-3)
+    parser.add_argument("--explore-entropy-scale", type=float, default=3e-4)
     parser.add_argument("--learn-cont", action="store_true")
     return parser.parse_args()
 
 @dataclass
 class RSSMState:
-    mean: torch.Tensor
-    std: torch.Tensor
+    logits: torch.Tensor
     stoch: torch.Tensor
     deter: torch.Tensor
 
 def stack_states(states: list[RSSMState]) -> RSSMState:
     return RSSMState(
-        mean=torch.stack([s.mean for s in states], dim=1),
-        std=torch.stack([s.std for s in states], dim=1),
+        logits=torch.stack([s.logits for s in states], dim=1),
         stoch=torch.stack([s.stoch for s in states], dim=1),
         deter=torch.stack([s.deter for s in states], dim=1),
     )
 
 def flatten_state(state: RSSMState) -> RSSMState:
     return RSSMState(
-        mean=state.mean.reshape(-1, state.mean.shape[-1]),
-        std=state.std.reshape(-1, state.std.shape[-1]),
-        stoch=state.stoch.reshape(-1, state.stoch.shape[-1]),
+        logits=state.logits.reshape(-1, *state.logits.shape[-2:]),
+        stoch=state.stoch.reshape(-1, *state.stoch.shape[-2:]),
         deter=state.deter.reshape(-1, state.deter.shape[-1]),
     )
 
 def detach_state(state: RSSMState) -> RSSMState:
     return RSSMState(
-        mean=state.mean.detach(),
-        std=state.std.detach(),
+        logits=state.logits.detach(),
         stoch=state.stoch.detach(),
         deter=state.deter.detach(),
     )
@@ -126,8 +113,6 @@ def preprocess_obs(obs: torch.Tensor) -> torch.Tensor:
     return obs - 0.5
 
 class DenseDecoder(nn.Module):
-    """State decoder for vector-observation Dreamer."""
-
     def __init__(
         self,
         in_dim: int,
@@ -137,40 +122,29 @@ class DenseDecoder(nn.Module):
         distribution: str = "normal",
     ):
         super().__init__()
-
         self.distribution = distribution
-        self.out_dim = out_dim
         self.net = MLP(
             in_dim,
             out_dim,
             hidden_dim=hidden_size,
             num_layers=num_layers,
             activation=nn.ELU,
-            norm=False
+            norm=False,
         )
 
     def forward(self, x: torch.Tensor):
         x = self.net(x)
-
         if self.distribution == "normal":
-            return td.independent.Independent(
-                td.Normal(x, 1), 1
-            )
-        
+            return td.Independent(td.Normal(x, 1), 1)
         if self.distribution == "binary":
-            return td.independent.Independent(
-                td.Bernoulli(logits=x), 1
-            )
-
+            return td.Independent(td.Bernoulli(logits=x), 1)
         raise NotImplementedError(self.distribution)
 
 class ConvEncoder(nn.Module):
-    """Dreamer V1 conv encoder: 64x64x3 -> 32*depth embedding."""
-
-    def __init__(self, depth: int = 32):
+    def __init__(self, in_channels: int, depth: int = 48):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(3, depth, 4, stride=2),
+            nn.Conv2d(in_channels, depth, 4, stride=2),
             nn.ReLU(),
             nn.Conv2d(depth, 2 * depth, 4, stride=2),
             nn.ReLU(),
@@ -182,13 +156,10 @@ class ConvEncoder(nn.Module):
         self.out_dim = 32 * depth
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        x = self.net(obs)
-        return x.reshape(obs.shape[0], -1)
+        return self.net(obs).reshape(obs.shape[0], -1)
 
 class ConvDecoder(nn.Module):
-    """Dreamer V1 conv decoder: feature -> image mean."""
-
-    def __init__(self, feat_dim: int, depth: int = 32):
+    def __init__(self, feat_dim: int, out_channels: int, depth: int = 48):
         super().__init__()
         self.out_channels = 32 * depth
         self.fc = nn.Linear(feat_dim, self.out_channels)
@@ -199,70 +170,77 @@ class ConvDecoder(nn.Module):
             nn.ReLU(),
             nn.ConvTranspose2d(2 * depth, depth, 6, stride=2),
             nn.ReLU(),
-            nn.ConvTranspose2d(depth, 3, 6, stride=2),
+            nn.ConvTranspose2d(depth, out_channels, 6, stride=2),
         )
 
     def forward(self, feat: torch.Tensor) -> torch.Tensor:
         x = self.fc(feat).reshape(-1, self.out_channels, 1, 1)
         return self.net(x)
-    
-class RSSM(nn.Module):
-    """Gaussian recurrent state-space model from Dreamer V1."""
 
+def sample_straight_through(logits: torch.Tensor) -> torch.Tensor:
+    probs = logits.softmax(dim=-1)
+    sample = td.OneHotCategorical(logits=logits).sample()
+    return sample + probs - probs.detach()
+
+def categorical_kl(post_logits: torch.Tensor, prior_logits: torch.Tensor) -> torch.Tensor:
+    post = td.OneHotCategorical(logits=post_logits)
+    prior = td.OneHotCategorical(logits=prior_logits)
+    return td.kl_divergence(post, prior).sum(dim=-1)
+
+class CategoricalRSSM(nn.Module):
     def __init__(
         self,
         action_dim: int,
         stoch_size: int,
+        stoch_classes: int,
         deter_size: int,
         hidden_size: int,
         embed_dim: int,
     ):
-        super(RSSM, self).__init__()
+        super().__init__()
         self.stoch_size = stoch_size
+        self.stoch_classes = stoch_classes
         self.deter_size = deter_size
+        stoch_dim = stoch_size * stoch_classes
 
-        self.img_in = nn.Linear(stoch_size+action_dim, hidden_size)
+        self.img_in = nn.Linear(stoch_dim + action_dim, hidden_size)
         self.gru = nn.GRUCell(hidden_size, deter_size)
         self.img_hidden = nn.Linear(deter_size, hidden_size)
-        self.img_out = nn.Linear(hidden_size, 2 * stoch_size)
+        self.img_out = nn.Linear(hidden_size, stoch_dim)
 
         self.obs_hidden = nn.Linear(deter_size + embed_dim, hidden_size)
-        self.obs_out = nn.Linear(hidden_size, 2 * stoch_size)
+        self.obs_out = nn.Linear(hidden_size, stoch_dim)
 
     def init_state(self, batch_size: int, device: torch.device) -> RSSMState:
-        mean = torch.zeros(batch_size, self.stoch_size, device=device)
-        std = torch.zeros(batch_size, self.stoch_size, device=device)
-        stoch = torch.zeros(batch_size, self.stoch_size, device=device)
+        logits = torch.zeros(batch_size, self.stoch_size, self.stoch_classes, device=device)
+        stoch = torch.zeros(batch_size, self.stoch_size, self.stoch_classes, device=device)
         deter = torch.zeros(batch_size, self.deter_size, device=device)
-        return RSSMState(mean=mean, std=std, stoch=stoch, deter=deter)
-    
+        return RSSMState(logits=logits, stoch=stoch, deter=deter)
+
+    def get_feat(self, state: RSSMState) -> torch.Tensor:
+        stoch = state.stoch.reshape(state.stoch.shape[0], -1)
+        return torch.cat([stoch, state.deter], dim=-1)
+
+    def calculate_state(self, logits: torch.Tensor, deter: torch.Tensor) -> RSSMState:
+        logits = logits.reshape(-1, self.stoch_size, self.stoch_classes)
+        stoch = sample_straight_through(logits)
+        return RSSMState(logits=logits, stoch=stoch, deter=deter)
+
     def calculate_prior(self, prev_state: RSSMState, prev_action: torch.Tensor) -> RSSMState:
-        
-        x = torch.cat([prev_state.stoch, prev_action], dim=-1)
+        stoch = prev_state.stoch.reshape(prev_state.stoch.shape[0], -1)
+        x = torch.cat([stoch, prev_action], dim=-1)
         x = F.elu(self.img_in(x))
         deter = self.gru(x, prev_state.deter)
         x = F.elu(self.img_hidden(deter))
-        out = self.img_out(x)
-        return self.calculate_stat(out, deter)
+        logits = self.img_out(x)
+        return self.calculate_state(logits, deter)
 
     def calculate_posterior(self, prior: RSSMState, embed: torch.Tensor) -> RSSMState:
         x = torch.cat([prior.deter, embed], dim=-1)
         x = F.elu(self.obs_hidden(x))
-        stats = self.obs_out(x)
-        return self.calculate_stat(stats, prior.deter)
+        logits = self.obs_out(x)
+        return self.calculate_state(logits, prior.deter)
 
-    def get_feat(self, state: RSSMState) -> torch.Tensor:
-        return torch.cat([state.stoch, state.deter], dim=-1)
-
-    def get_dist(self, state: RSSMState) -> td.Normal:
-        return td.Normal(state.mean, state.std)
-
-    def calculate_stat(self, stats: torch.Tensor, deter: torch.Tensor) -> RSSMState:
-        mean, std = stats.chunk(2, dim=-1)
-        std = F.softplus(std) + 0.1
-        stoch = td.Normal(mean, std).rsample()
-        return RSSMState(mean=mean, std=std, stoch=stoch, deter=deter)
-    
     def obs_step(
         self,
         prev_state: RSSMState,
@@ -285,7 +263,6 @@ class RSSM(nn.Module):
 
         priors = []
         posts = []
-
         prev_state = state
         for t in range(horizon):
             post, prior = self.obs_step(prev_state, actions[:, t], embeds[:, t])
@@ -294,76 +271,39 @@ class RSSM(nn.Module):
             prev_state = post
         return stack_states(posts), stack_states(priors)
 
-class TanhNormalActor(nn.Module):
-    def __init__(
-        self,
-        feat_dim: int,
-        action_dim: int,
-        units: int,
-        init_std: float,
-        min_std: float,
-        mean_scale: float,
-    ):
+class DiscreteActor(nn.Module):
+    def __init__(self, feat_dim: int, action_dim: int, hidden_size: int):
         super().__init__()
         self.net = MLP(
             feat_dim,
-            2 * action_dim,
-            hidden_dim=units,
+            action_dim,
+            hidden_dim=hidden_size,
             num_layers=4,
             activation=nn.ELU,
             norm=False,
         )
-        self.raw_init_std = math.log(math.exp(init_std) - 1.0)
-        self.min_std = min_std
-        self.mean_scale = mean_scale
 
-    def forward(self, feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        out = self.net(feat)
-        mean, std = out.chunk(2, dim=-1)
-        mean = self.mean_scale * torch.tanh(mean / self.mean_scale)
-        std = F.softplus(std + self.raw_init_std) + self.min_std
-        return mean, std, torch.tanh(mean)
+    def forward(self, feat: torch.Tensor) -> td.OneHotCategorical:
+        return td.OneHotCategorical(logits=self.net(feat))
 
-    def sample(
-        self,
-        feat: torch.Tensor,
-        deterministic: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        mean, std, mode = self.forward(feat)
-        if deterministic:
-            return mode, torch.zeros(feat.shape[0], device=feat.device)
-
-        dist = td.Normal(mean, std)
-        raw = dist.rsample()
-        action = torch.tanh(raw)
-        log_prob = dist.log_prob(raw).sum(dim=-1)
-        log_prob -= torch.log(1 - action.pow(2) + 1e-6).sum(dim=-1)
-        return action, log_prob
-
-class DreamerModel(nn.Module):
-    def __init__(self, action_dim: int, args):
+class DreamerV2Model(nn.Module):
+    def __init__(self, obs_shape: tuple[int, ...], action_dim: int, args):
         super().__init__()
         self.action_dim = action_dim
-        self.encoder = ConvEncoder(depth=args.cnn_depth)
-        self.rssm = RSSM(
-            action_dim,
+        self.encoder = ConvEncoder(obs_shape[0], depth=args.cnn_depth)
+        self.rssm = CategoricalRSSM(
+            action_dim=action_dim,
             stoch_size=args.stoch_size,
+            stoch_classes=args.stoch_classes,
             deter_size=args.deter_size,
             hidden_size=args.rssm_hidden_size,
             embed_dim=self.encoder.out_dim,
         )
-        feat_dim = args.stoch_size + args.deter_size
-        self.decoder = ConvDecoder(feat_dim, depth=args.cnn_depth)
+        feat_dim = args.stoch_size * args.stoch_classes + args.deter_size
+        self.decoder = ConvDecoder(feat_dim, obs_shape[0], depth=args.cnn_depth)
         self.reward = DenseDecoder(feat_dim, 1, hidden_size=args.num_units, num_layers=2)
         self.value = DenseDecoder(feat_dim, 1, hidden_size=args.num_units, num_layers=3)
-        self.actor = TanhNormalActor(
-            feat_dim,
-            action_dim,
-            units=args.num_units,
-            init_std=args.action_init_std,
-            min_std=args.min_std,
-            mean_scale=args.mean_scale,
-        )
+        self.actor = DiscreteActor(feat_dim, action_dim, args.num_units)
         self.cont = (
             DenseDecoder(
                 feat_dim,
@@ -385,16 +325,11 @@ class DreamerModel(nn.Module):
                 nn.init.zeros_(module.bias)
 
 def preprocess_batch(batch: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
-    obs = torch.tensor(batch["obs"], dtype=torch.float32, device=device)
-    action = torch.tensor(batch["action"], dtype=torch.float32, device=device)
+    obs = torch.tensor(np.asarray(batch["obs"]), dtype=torch.float32, device=device)
+    action = torch.tensor(np.asarray(batch["action"]), dtype=torch.float32, device=device)
     reward = torch.tensor(batch["reward"], dtype=torch.float32, device=device)
     done = torch.tensor(batch["done"], dtype=torch.float32, device=device)
-    return {
-        "obs": preprocess_obs(obs),
-        "action": action,
-        "reward": reward,
-        "done": done,
-    }
+    return {"obs": preprocess_obs(obs), "action": action, "reward": reward, "done": done}
 
 def lambda_return(
     reward: torch.Tensor,
@@ -403,42 +338,16 @@ def lambda_return(
     bootstrap: torch.Tensor,
     lambda_: float,
 ) -> torch.Tensor:
-    horizon = reward.shape[0]
     returns = torch.zeros_like(reward)
     next_value = bootstrap
-    for t in reversed(range(horizon)):
+    for t in reversed(range(reward.shape[0])):
         next_value = reward[t] + discount[t] * ((1 - lambda_) * value[t] + lambda_ * next_value)
         returns[t] = next_value
     return returns
 
-def imagine_rollout(
-    model: DreamerModel,
-    start: RSSMState,
-    args,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    state = start
-    feats = []
-    discounts = []
-
-    for _ in range(args.imagine_horizon):
-        feat = model.rssm.get_feat(state)
-        action, _ = model.actor.sample(feat.detach(), deterministic=False)
-        state = model.rssm.calculate_prior(state, action)
-        feat = model.rssm.get_feat(state)
-        feats.append(feat)
-        if model.cont is not None:
-            discounts.append(model.cont(feat).mean.squeeze(-1) * args.discount)
-        else:
-            discounts.append(torch.full(feat.shape[:1], args.discount, device=feat.device))
-
-    imag_feat = torch.stack(feats, dim=0)
-    discount = torch.stack(discounts, dim=0)
-    reward = model.reward(imag_feat.reshape(-1, imag_feat.shape[-1])).mean.squeeze(-1)
-    reward = reward.reshape(args.imagine_horizon, -1)
-    return imag_feat, reward, discount
 
 def world_model_loss(
-    model: DreamerModel,
+    model: DreamerV2Model,
     batch: dict[str, torch.Tensor],
     args,
 ) -> tuple[torch.Tensor, RSSMState, dict[str, float]]:
@@ -451,49 +360,94 @@ def world_model_loss(
     embed = model.encoder(target_obs.reshape(-1, *target_obs.shape[-3:]))
     embed = embed.reshape(target_obs.shape[0], target_obs.shape[1], -1)
     post, prior = model.rssm.observe(embed, action)
-    feat = model.rssm.get_feat(post)
+    feat = model.rssm.get_feat(flatten_state(post))
+    feat = feat.reshape(target_obs.shape[0], target_obs.shape[1], -1)
 
     recon = model.decoder(feat.reshape(-1, feat.shape[-1]))
     recon = recon.reshape(target_obs.shape[0], target_obs.shape[1], *target_obs.shape[-3:])
-
     image_dist = td.Normal(recon, torch.ones_like(recon))
     obs_loss = -image_dist.log_prob(target_obs).sum(dim=(2, 3, 4)).mean()
 
     reward_dist = model.reward(feat.reshape(-1, feat.shape[-1]))
     reward_loss = -reward_dist.log_prob(reward.reshape(-1, 1)).mean()
 
-    kl = torch.distributions.kl_divergence(model.rssm.get_dist(post), model.rssm.get_dist(prior))
-    kl = kl.sum(dim=-1).mean()
-    kl_loss = torch.maximum(kl, torch.tensor(args.free_nats, device=kl.device))
-
-    total = obs_loss + reward_loss + args.kl_scale * kl_loss
-    cont_loss = torch.tensor(0.0, device=obs.device)
     if model.cont is not None:
         cont_dist = model.cont(feat.reshape(-1, feat.shape[-1]))
         cont_target = args.discount * (1.0 - done)
         cont_loss = -cont_dist.log_prob(cont_target.reshape(-1, 1)).mean()
+    else:
+        cont_loss = torch.tensor(0.0, device=obs.device)
+
+    prior_logits = prior.logits
+    post_logits = post.logits
+    kl_lhs = categorical_kl(post_logits.detach(), prior_logits).mean()
+    kl_rhs = categorical_kl(post_logits, prior_logits.detach()).mean()
+    kl_loss = args.kl_scale * (args.kl_balance * kl_lhs + (1 - args.kl_balance) * kl_rhs)
+
+    total = obs_loss + reward_loss + kl_loss
+    if model.cont is not None:
         total = total + args.pcont_scale * cont_loss
 
     metrics = {
         "losses/model": total.item(),
         "losses/recon": obs_loss.item(),
         "losses/reward": reward_loss.item(),
-        "losses/kl": kl.item(),
-        "losses/kl_clamped": kl_loss.item(),
+        "losses/kl": (kl_lhs + kl_rhs).item() * 0.5,
+        "losses/kl_lhs": kl_lhs.item(),
+        "losses/kl_rhs": kl_rhs.item(),
     }
     if model.cont is not None:
         metrics["losses/cont"] = cont_loss.item()
     return total, post, metrics
 
+def imagine_rollout(
+    model: DreamerV2Model,
+    start: RSSMState,
+    args,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    state = start
+    feats = []
+    rewards = []
+    discounts = []
+    log_probs = []
+    entropies = []
+
+    for _ in range(args.imagine_horizon):
+        feat = model.rssm.get_feat(state)
+        action_dist = model.actor(feat.detach())
+        action_idx = action_dist.sample()
+        action = action_idx + action_dist.probs - action_dist.probs.detach()
+        log_prob = action_dist.log_prob(action_idx)
+        entropy = action_dist.entropy()
+        state = model.rssm.calculate_prior(state, action)
+        feat = model.rssm.get_feat(state)
+
+        feats.append(feat)
+        rewards.append(model.reward(feat).mean.squeeze(-1))
+        log_probs.append(log_prob)
+        entropies.append(entropy)
+        if model.cont is not None:
+            discounts.append(model.cont(feat).mean.squeeze(-1) * args.discount)
+        else:
+            discounts.append(torch.full(feat.shape[:1], args.discount, device=feat.device))
+
+    return (
+        torch.stack(feats, dim=0),
+        torch.stack(rewards, dim=0),
+        torch.stack(discounts, dim=0),
+        torch.stack(log_probs, dim=0),
+        torch.stack(entropies, dim=0),
+    )
+
+
 def behavior_losses(
-    model: DreamerModel,
+    model: DreamerV2Model,
     post: RSSMState,
     args,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     if model.cont is not None:
         post = RSSMState(
-            mean=post.mean[:, :-1],
-            std=post.std[:, :-1],
+            logits=post.logits[:, :-1],
             stoch=post.stoch[:, :-1],
             deter=post.deter[:, :-1],
         )
@@ -504,10 +458,9 @@ def behavior_losses(
         model_modules.append(model.cont)
 
     set_requires_grad(model_modules + [model.value], False)
-    imag_feat, reward, discount = imagine_rollout(model, start, args)
-    value_dist = model.value(imag_feat.reshape(-1, imag_feat.shape[-1]))
-    value = value_dist.mean.squeeze(-1).reshape(args.imagine_horizon, -1)
-
+    imag_feat, reward, discount, log_prob, entropy = imagine_rollout(model, start, args)
+    value = model.value(imag_feat.reshape(-1, imag_feat.shape[-1])).mean.squeeze(-1)
+    value = value.reshape(args.imagine_horizon, -1)
     returns = lambda_return(
         reward[:-1],
         value[:-1],
@@ -515,13 +468,16 @@ def behavior_losses(
         bootstrap=value[-1],
         lambda_=args.lambda_return,
     )
+    set_requires_grad(model_modules + [model.value], True)
+
+    baseline = value[:-1].detach()
+    advantage = returns.detach() - baseline
     weights = torch.cumprod(
         torch.cat([torch.ones_like(discount[:1]), discount[:-2]], dim=0),
         dim=0,
     )
-
-    actor_loss = -(weights * returns).mean()
-    set_requires_grad(model_modules + [model.value], True)
+    actor_objective = log_prob[:-1] * advantage + args.actor_entropy_scale * entropy[:-1]
+    actor_loss = -(weights.detach() * actor_objective).mean()
 
     with torch.no_grad():
         value_feat = imag_feat[:-1].detach()
@@ -538,11 +494,13 @@ def behavior_losses(
         "losses/value": value_loss.item(),
         "algo/imagined_reward": reward.mean().item(),
         "algo/imagined_value": value.mean().item(),
+        "algo/policy_entropy": entropy.mean().item(),
     }
     return actor_loss, value_loss, metrics
 
+
 def train_step(
-    model: DreamerModel,
+    model: DreamerV2Model,
     model_opt: optim.Optimizer,
     actor_opt: optim.Optimizer,
     value_opt: optim.Optimizer,
@@ -585,17 +543,18 @@ def train_step(
     metrics["grads/value"] = float(value_grad)
     return metrics
 
+
 @torch.no_grad()
 def act(
-    model: DreamerModel,
+    model: DreamerV2Model,
     obs: np.ndarray,
     prev_state: RSSMState | None,
     prev_action: torch.Tensor | None,
     device: torch.device,
     deterministic: bool,
-    expl_amount: float,
-) -> tuple[np.ndarray, RSSMState, torch.Tensor]:
-    obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+    entropy_scale: float,
+) -> tuple[int, RSSMState, torch.Tensor]:
+    obs_t = torch.tensor(np.asarray(obs), dtype=torch.float32, device=device).unsqueeze(0)
     embed = model.encoder(preprocess_obs(obs_t))
     if prev_state is None:
         prev_state = model.rssm.init_state(1, device)
@@ -604,22 +563,24 @@ def act(
 
     post, _ = model.rssm.obs_step(prev_state, prev_action, embed)
     feat = model.rssm.get_feat(post)
-    action_t, _ = model.actor.sample(feat, deterministic=deterministic)
-    if not deterministic and expl_amount > 0:
-        action_t = torch.clamp(action_t + expl_amount * torch.randn_like(action_t), -1.0, 1.0)
-    return action_t.squeeze(0).cpu().numpy(), post, action_t
+    action_dist = model.actor(feat)
+    if deterministic:
+        action_idx = action_dist.probs.argmax(dim=-1)
+    else:
+        action_idx = action_dist.sample()
+    action = F.one_hot(action_idx, model.action_dim).float()
+    return int(action_idx.item()), post, action
+
 
 @torch.no_grad()
 def evaluate_agent(
-    model: DreamerModel,
+    model: DreamerV2Model,
     env_fn,
     num_episodes: int,
     device: torch.device,
-    eval_noise: float,
 ) -> dict[str, float]:
     returns = []
     lengths = []
-
     for _ in range(num_episodes):
         env = env_fn()
         obs, _ = env.reset()
@@ -628,7 +589,6 @@ def evaluate_agent(
         prev_action = None
         ep_return = 0.0
         ep_length = 0
-
         while not done:
             action, latent_state, prev_action = act(
                 model,
@@ -637,23 +597,22 @@ def evaluate_agent(
                 prev_action,
                 device,
                 deterministic=True,
-                expl_amount=eval_noise,
+                entropy_scale=0.0,
             )
             obs, reward, terminated, truncated, _ = env.step(action)
             ep_return += reward
             ep_length += 1
             done = terminated or truncated
-
         returns.append(ep_return)
         lengths.append(ep_length)
         env.close()
-
     return {
         "mean_return": float(np.mean(returns)),
         "std_return": float(np.std(returns)),
         "mean_length": float(np.mean(lengths)),
         "returns": returns,
     }
+
 
 if __name__ == "__main__":
     args = parse_args()
@@ -664,6 +623,7 @@ if __name__ == "__main__":
         args.env_id,
         seed=args.seed,
         img_size=args.img_size,
+        frame_stack=args.frame_stack,
     )
 
     def eval_env_fn():
@@ -671,12 +631,13 @@ if __name__ == "__main__":
             args.env_id,
             seed=args.seed + 100,
             img_size=args.img_size,
+            frame_stack=args.frame_stack,
         )
 
-    obs_shape = env.observation_space.shape
-    action_dim = int(np.prod(env.action_space.shape))
+    obs_shape = tuple(env.observation_space.shape)
+    action_dim = int(env.action_space.n)
 
-    model = DreamerModel(action_dim, args).to(device)
+    model = DreamerV2Model(obs_shape, action_dim, args).to(device)
     model_opt = optim.Adam(
         list(model.encoder.parameters())
         + list(model.rssm.parameters())
@@ -697,13 +658,13 @@ if __name__ == "__main__":
 
     logger = Logger(
         project=args.wandb_project,
-        name=f"dreamer_{args.env_id}_s{args.seed}",
+        name=f"dreamerv2_{args.env_id.replace('/', '_')}_s{args.seed}",
         config=vars(args),
         use_wandb=args.track,
     )
 
     print(
-        f"Dreamer V1 DMControl | env={args.env_id} | obs={obs_shape} | act={action_dim} | "
+        f"DreamerV2 Atari | env={args.env_id} | obs={obs_shape} | act={action_dim} | "
         f"params={sum(p.numel() for p in model.parameters()) / 1e6:.2f}M"
     )
 
@@ -715,21 +676,23 @@ if __name__ == "__main__":
 
     for step in range(args.total_steps):
         if step < args.prefill_steps:
-            action = env.action_space.sample()
+            env_action = int(env.action_space.sample())
+            action_vec = F.one_hot(torch.tensor(env_action), action_dim).float().cpu().numpy()
         else:
-            action, latent_state, prev_action = act(
+            env_action, latent_state, prev_action = act(
                 model,
                 obs,
                 latent_state,
                 prev_action,
                 device,
                 deterministic=False,
-                expl_amount=args.expl_amount,
+                entropy_scale=args.explore_entropy_scale,
             )
+            action_vec = prev_action.squeeze(0).cpu().numpy()
 
-        next_obs, reward, terminated, truncated, _ = env.step(action)
+        next_obs, reward, terminated, truncated, _ = env.step(env_action)
         done = terminated or truncated
-        buffer.add_step(obs, action.astype(np.float32), float(reward), done)
+        buffer.add_step(obs, action_vec.astype(np.float32), float(reward), done)
 
         episode_return += reward
         episode_length += 1
@@ -767,7 +730,6 @@ if __name__ == "__main__":
                 eval_env_fn,
                 num_episodes=args.eval_episodes,
                 device=device,
-                eval_noise=args.eval_noise,
             )
             print(
                 f"Step {step:>7d} | eval={eval_result['mean_return']:.1f} "
@@ -786,9 +748,10 @@ if __name__ == "__main__":
         {
             "model": model.state_dict(),
             "action_dim": action_dim,
+            "obs_shape": obs_shape,
             "args": vars(args),
         },
-        f"dreamer_{args.env_id}_s{args.seed}.pt",
+        f"dreamerv2_{args.env_id.replace('/', '_')}_s{args.seed}.pt",
     )
     logger.close()
     env.close()
