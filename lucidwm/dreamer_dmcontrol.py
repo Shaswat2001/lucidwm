@@ -20,16 +20,16 @@ Example:
   python -m lucidwm.dreamer_dmcontrol --env-id walker-walk --seed 1 --track
 """
 
-import argparse
 import math
+import argparse
+import numpy as np
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Normal
+import torch.nn.functional as F
+import torch.distributions as td
 
 from lucidwm_components.networks import MLP
 from lucidwm_utils.buffers import ReplayBuffer
@@ -114,6 +114,51 @@ def detach_state(state: RSSMState) -> RSSMState:
         stoch=state.stoch.detach(),
         deter=state.deter.detach(),
     )
+
+def set_requires_grad(modules: list[nn.Module], requires_grad: bool):
+    for module in modules:
+        if module is None:
+            continue
+        for param in module.parameters():
+            param.requires_grad_(requires_grad)
+
+class DenseDecoder(nn.Module):
+    """State decoder for vector-observation Dreamer."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        hidden_size: int,
+        num_layers: int = 2,
+        distribution: str = "normal",
+    ):
+        super().__init__()
+
+        self.distribution = distribution
+        self.out_dim = out_dim
+        self.net = MLP(
+            in_dim,
+            out_dim,
+            hidden_dim=hidden_size,
+            num_layers=num_layers,
+            activation=nn.ELU,
+        )
+
+    def forward(self, x: torch.Tensor):
+        x = self.net(x)
+
+        if self.distribution == "normal":
+            return td.independent.Independent(
+                td.Normal(x, 1), 1
+            )
+        
+        if self.distribution == "binary":
+            return td.independent.Independent(
+                td.Bernoulli(logits=x), 1
+            )
+
+        raise NotImplementedError(self.distribution)
 
 class ConvEncoder(nn.Module):
     """Dreamer V1 conv encoder: 64x64x3 -> 32*depth embedding."""
@@ -205,13 +250,13 @@ class RSSM(nn.Module):
     def get_feat(self, state: RSSMState) -> torch.Tensor:
         return torch.cat([state.stoch, state.deter], dim=-1)
 
-    def get_dist(self, state: RSSMState) -> Normal:
-        return Normal(state.mean, state.std)
+    def get_dist(self, state: RSSMState) -> td.Normal:
+        return td.Normal(state.mean, state.std)
 
     def calculate_stat(self, stats: torch.Tensor, deter: torch.Tensor) -> RSSMState:
         mean, std = stats.chunk(2, dim=-1)
         std = F.softplus(std) + 0.1
-        stoch = Normal(mean, std).rsample()
+        stoch = td.Normal(mean, std).rsample()
         return RSSMState(mean=mean, std=std, stoch=stoch, deter=deter)
     
     def obs_step(
@@ -284,7 +329,7 @@ class TanhNormalActor(nn.Module):
         if deterministic:
             return mode, torch.zeros(feat.shape[0], device=feat.device)
 
-        dist = Normal(mean, std)
+        dist = td.Normal(mean, std)
         raw = dist.rsample()
         action = torch.tanh(raw)
         log_prob = dist.log_prob(raw).sum(dim=-1)
@@ -305,8 +350,8 @@ class DreamerModel(nn.Module):
         )
         feat_dim = args.stoch_size + args.deter_size
         self.decoder = ConvDecoder(feat_dim, depth=args.cnn_depth)
-        self.reward = MLP(feat_dim, 1, num_layers=2, hidden_dim=args.num_units, norm=False)
-        self.value = MLP(feat_dim, 1, num_layers=3, hidden_dim=args.num_units, norm=False)
+        self.reward = DenseDecoder(feat_dim, 1, hidden_size=args.num_units, num_layers=2)
+        self.value = DenseDecoder(feat_dim, 1, hidden_size=args.num_units, num_layers=3)
         self.actor = TanhNormalActor(
             feat_dim,
             action_dim,
@@ -316,7 +361,13 @@ class DreamerModel(nn.Module):
             mean_scale=args.mean_scale,
         )
         self.cont = (
-            MLP(feat_dim, 1, num_layers=3, hidden_dim=args.num_units, norm=False)
+            DenseDecoder(
+                feat_dim,
+                1,
+                hidden_size=args.num_units,
+                num_layers=3,
+                distribution="binary",
+            )
             if args.learn_cont
             else None
         )
@@ -360,11 +411,10 @@ def imagine_rollout(
     model: DreamerModel,
     start: RSSMState,
     args,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    state = detach_state(start)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    state = start
     feats = []
     discounts = []
-    rewards = []
 
     for _ in range(args.imagine_horizon):
         feat = model.rssm.get_feat(state)
@@ -372,18 +422,16 @@ def imagine_rollout(
         state = model.rssm.calculate_prior(state, action)
         feat = model.rssm.get_feat(state)
         feats.append(feat)
-        rewards.append(model.reward(feat).squeeze(-1))
         if model.cont is not None:
-            discounts.append(torch.sigmoid(model.cont(feat)).squeeze(-1) * args.discount)
+            discounts.append(model.cont(feat).mean.squeeze(-1) * args.discount)
         else:
-            discounts.append(torch.full_like(rewards[-1], args.discount))
+            discounts.append(torch.full(feat.shape[:1], args.discount, device=feat.device))
 
     imag_feat = torch.stack(feats, dim=0)
-    reward = torch.stack(rewards, dim=0)
     discount = torch.stack(discounts, dim=0)
-    value = model.value(imag_feat.reshape(-1, imag_feat.shape[-1]))
-    value = value.reshape(args.imagine_horizon, -1)
-    return imag_feat, reward, discount, value
+    reward = model.reward(imag_feat.reshape(-1, imag_feat.shape[-1])).mean.squeeze(-1)
+    reward = reward.reshape(args.imagine_horizon, -1)
+    return imag_feat, reward, discount
 
 def world_model_loss(
     model: DreamerModel,
@@ -403,10 +451,12 @@ def world_model_loss(
 
     recon = model.decoder(feat.reshape(-1, feat.shape[-1]))
     recon = recon.reshape(target_obs.shape[0], target_obs.shape[1], *target_obs.shape[-3:])
-    reward_pred = model.reward(feat.reshape(-1, feat.shape[-1])).reshape_as(reward)
 
-    obs_loss = F.mse_loss(recon, target_obs, reduction="none").mean(dim=(2, 3, 4)).mean()
-    reward_loss = F.mse_loss(reward_pred, reward, reduction="none").mean()
+    image_dist = td.Normal(recon, torch.ones_like(recon))
+    obs_loss = -image_dist.log_prob(target_obs).sum(dim=(2, 3, 4)).mean()
+
+    reward_dist = model.reward(feat.reshape(-1, feat.shape[-1]))
+    reward_loss = -reward_dist.log_prob(reward.reshape(-1, 1)).mean()
 
     kl = torch.distributions.kl_divergence(model.rssm.get_dist(post), model.rssm.get_dist(prior))
     kl = kl.sum(dim=-1).mean()
@@ -415,9 +465,9 @@ def world_model_loss(
     total = obs_loss + reward_loss + args.kl_scale * kl_loss
     cont_loss = torch.tensor(0.0, device=obs.device)
     if model.cont is not None:
-        cont_logits = model.cont(feat.reshape(-1, feat.shape[-1])).reshape_as(done)
-        cont_target = 1.0 - done
-        cont_loss = F.binary_cross_entropy_with_logits(cont_logits, cont_target)
+        cont_dist = model.cont(feat.reshape(-1, feat.shape[-1]))
+        cont_target = args.discount * (1.0 - done)
+        cont_loss = -cont_dist.log_prob(cont_target.reshape(-1, 1)).mean()
         total = total + args.pcont_scale * cont_loss
 
     metrics = {
@@ -436,8 +486,23 @@ def behavior_losses(
     post: RSSMState,
     args,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
-    start = flatten_state(post)
-    imag_feat, reward, discount, value = imagine_rollout(model, start, args)
+    if model.cont is not None:
+        post = RSSMState(
+            mean=post.mean[:, :-1],
+            std=post.std[:, :-1],
+            stoch=post.stoch[:, :-1],
+            deter=post.deter[:, :-1],
+        )
+
+    start = detach_state(flatten_state(post))
+    model_modules = [model.encoder, model.decoder, model.reward, model.rssm]
+    if model.cont is not None:
+        model_modules.append(model.cont)
+
+    set_requires_grad(model_modules + [model.value], False)
+    imag_feat, reward, discount = imagine_rollout(model, start, args)
+    value_dist = model.value(imag_feat.reshape(-1, imag_feat.shape[-1]))
+    value = value_dist.mean.squeeze(-1).reshape(args.imagine_horizon, -1)
 
     returns = lambda_return(
         reward[:-1],
@@ -452,11 +517,17 @@ def behavior_losses(
     )
 
     actor_loss = -(weights * returns).mean()
+    set_requires_grad(model_modules + [model.value], True)
 
-    value_feat = imag_feat[:-1].detach().reshape(-1, imag_feat.shape[-1])
-    value_pred = model.value(value_feat).reshape(args.imagine_horizon - 1, -1)
-    value_loss = 0.5 * (value_pred - returns.detach()).pow(2)
-    value_loss = (weights.detach() * value_loss).mean()
+    with torch.no_grad():
+        value_feat = imag_feat[:-1].detach()
+        value_target = returns.detach()
+        value_weight = weights.detach()
+
+    value_pred = model.value(value_feat.reshape(-1, value_feat.shape[-1]))
+    value_loss = -value_pred.log_prob(value_target.reshape(-1, 1))
+    value_loss = value_loss.reshape(args.imagine_horizon - 1, -1)
+    value_loss = (value_weight * value_loss).mean()
 
     metrics = {
         "losses/actor": actor_loss.item(),
