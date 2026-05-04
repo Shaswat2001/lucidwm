@@ -191,10 +191,10 @@ def make_env(
     Returns:
         Wrapped gymnasium environment.
     """
-    suite = _detect_suite(env_id)
+    suite = detect_suite(env_id)
 
     if suite == "dmc":
-        env = _make_dmc(
+        env = make_dmc(
             env_id,
             seed,
             obs=obs or "state",
@@ -203,11 +203,11 @@ def make_env(
             time_limit=time_limit,
         )
     elif suite == "atari":
-        env = _make_atari(env_id, seed, img_size, frame_stack or 4)
+        env = make_atari(env_id, seed, img_size, frame_stack or 4)
     elif suite == "crafter":
-        env = _make_crafter(seed, img_size)
+        env = make_crafter(seed, img_size)
     elif suite == "metaworld":
-        env = _make_metaworld(env_id, seed)
+        env = make_metaworld(env_id, seed)
     else:
         # Generic gymnasium env (e.g., CarRacing)
         env = gym.make(env_id, render_mode="rgb_array")
@@ -215,7 +215,7 @@ def make_env(
 
     return env
 
-def _detect_suite(env_id: str) -> str:
+def detect_suite(env_id: str) -> str:
     """Detect environment suite from env_id string."""
     dmc_domains = {
         "cartpole", "cheetah", "walker", "reacher", "cup", "finger",
@@ -234,7 +234,7 @@ def _detect_suite(env_id: str) -> str:
         return "metaworld"
     return "gym"
 
-def _make_dmc(
+def make_dmc(
     env_id: str,
     seed: int,
     obs: str = "state",
@@ -278,7 +278,7 @@ def _make_dmc(
     env = gym.wrappers.RecordEpisodeStatistics(env)
     return env
 
-def _make_atari(env_id: str, seed: int, img_size: int, frame_stack: int) -> gym.Env:
+def make_atari(env_id: str, seed: int, img_size: int, frame_stack: int) -> gym.Env:
     """Create Atari environment with standard preprocessing."""
     env = gym.make(env_id, render_mode="rgb_array")
     env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -293,7 +293,7 @@ def _make_atari(env_id: str, seed: int, img_size: int, frame_stack: int) -> gym.
     env = gym.wrappers.FrameStackObservation(env, frame_stack)
     return env
 
-def _make_crafter(seed: int, img_size: int) -> gym.Env:
+def make_crafter(seed: int, img_size: int) -> gym.Env:
     """Create Crafter environment."""
     import crafter
 
@@ -303,7 +303,7 @@ def _make_crafter(seed: int, img_size: int) -> gym.Env:
     env = gym.wrappers.RecordEpisodeStatistics(env)
     return env
 
-def _make_metaworld(env_id: str, seed: int) -> gym.Env:
+def make_metaworld(env_id: str, seed: int) -> gym.Env:
     """Create MetaWorld environment."""
     import metaworld
 
