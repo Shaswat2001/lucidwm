@@ -456,8 +456,8 @@ def world_model_loss(
     recon = model.decoder(feat.reshape(-1, feat.shape[-1]))
     recon = recon.reshape(target_obs.shape[0], target_obs.shape[1], *target_obs.shape[-3:])
 
-    image_dist = td.Normal(recon, torch.ones_like(recon))
-    obs_loss = -image_dist.log_prob(target_obs).sum(dim=(2, 3, 4)).mean()
+    image_dist = td.Independent(td.Normal(recon, 1), 3)
+    obs_loss = -image_dist.log_prob(target_obs).mean()
 
     reward_dist = model.reward(feat.reshape(-1, feat.shape[-1]))
     reward_loss = -reward_dist.log_prob(reward.reshape(-1, 1)).mean()
