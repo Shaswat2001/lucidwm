@@ -24,7 +24,9 @@ import math
 import argparse
 import numpy as np
 from dataclasses import dataclass
+from contextlib import nullcontext
 
+import gymnasium as gym
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -48,6 +50,12 @@ def parse_args():
     parser.add_argument("--eval-episodes", type=int, default=10)
     parser.add_argument("--track", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="lucidwm")
+    parser.add_argument("--fast", action="store_true",
+                        help="T4-friendly preset: smaller batches/models, fewer updates, AMP on.")
+    parser.add_argument("--num-envs", type=int, default=1,
+                        help="Parallel envs for data collection.")
+    parser.add_argument("--amp", action="store_true",
+                        help="Enable mixed precision on CUDA.")
 
     parser.add_argument("--img-size", type=int, default=64)
     parser.add_argument("--action-repeat", type=int, default=2)
@@ -82,7 +90,19 @@ def parse_args():
     parser.add_argument("--eval-noise", type=float, default=0.0)
 
     parser.add_argument("--learn-cont", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.fast:
+        args.batch_size = 16
+        args.batch_length = 16
+        args.train_steps = 25
+        args.train_every = max(args.train_every, 500)
+        args.cnn_depth = 24
+        args.deter_size = 128
+        args.rssm_hidden_size = 128
+        args.num_units = 256
+        args.prefill_steps = min(args.prefill_steps, 2_000)
+        args.amp = True
+    return args
 
 @dataclass
 class RSSMState:
@@ -549,6 +569,7 @@ def train_step(
     batch: dict[str, np.ndarray],
     args,
     device: torch.device,
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> dict[str, float]:
     batch_t = preprocess_batch(batch, device)
 
@@ -556,12 +577,23 @@ def train_step(
     actor_opt.zero_grad(set_to_none=True)
     value_opt.zero_grad(set_to_none=True)
 
-    model_loss, post, wm_metrics = world_model_loss(model, batch_t, args)
-    actor_loss, value_loss, behavior_metrics = behavior_losses(model, post, args)
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if amp_enabled else nullcontext()
+    with autocast_ctx:
+        model_loss, post, wm_metrics = world_model_loss(model, batch_t, args)
+        actor_loss, value_loss, behavior_metrics = behavior_losses(model, post, args)
 
-    model_loss.backward()
-    actor_loss.backward()
-    value_loss.backward()
+    if scaler is not None and scaler.is_enabled():
+        scaler.scale(model_loss).backward()
+        scaler.scale(actor_loss).backward()
+        scaler.scale(value_loss).backward()
+        scaler.unscale_(model_opt)
+        scaler.unscale_(actor_opt)
+        scaler.unscale_(value_opt)
+    else:
+        model_loss.backward()
+        actor_loss.backward()
+        value_loss.backward()
 
     model_grad = torch.nn.utils.clip_grad_norm_(
         list(model.encoder.parameters())
@@ -574,9 +606,15 @@ def train_step(
     actor_grad = torch.nn.utils.clip_grad_norm_(model.actor.parameters(), args.grad_clip)
     value_grad = torch.nn.utils.clip_grad_norm_(model.value.parameters(), args.grad_clip)
 
-    model_opt.step()
-    actor_opt.step()
-    value_opt.step()
+    if scaler is not None and scaler.is_enabled():
+        scaler.step(model_opt)
+        scaler.step(actor_opt)
+        scaler.step(value_opt)
+        scaler.update()
+    else:
+        model_opt.step()
+        actor_opt.step()
+        value_opt.step()
 
     metrics = dict(wm_metrics)
     metrics.update(behavior_metrics)
@@ -655,29 +693,98 @@ def evaluate_agent(
         "returns": returns,
     }
 
-if __name__ == "__main__":
-    args = parse_args()
-    set_seed(args.seed)
-    device = get_device()
 
-    env = make_env(
-        args.env_id,
-        seed=args.seed,
-        obs="rgb",
-        img_size=args.img_size,
-        action_repeat=args.action_repeat,
-        time_limit=args.time_limit,
-    )
-
-    def eval_env_fn():
+def make_env_fn(args, seed_offset: int = 0):
+    def thunk():
         return make_env(
             args.env_id,
-            seed=args.seed + 100,
+            seed=args.seed + seed_offset,
             obs="rgb",
             img_size=args.img_size,
             action_repeat=args.action_repeat,
             time_limit=args.time_limit,
         )
+    return thunk
+
+def collect_vectorized_steps(
+    envs,
+    model: DreamerModel,
+    buffer: ReplayBuffer,
+    args,
+    device: torch.device,
+    total_env_steps: int,
+    latent_states: list[RSSMState | None],
+    prev_actions: list[torch.Tensor | None],
+    episode_storage: list[dict[str, list]],
+    episode_returns: np.ndarray,
+    episode_lengths: np.ndarray,
+    logger: Logger,
+):
+    observations = collect_vectorized_steps.observations
+
+    if total_env_steps < args.prefill_steps:
+        actions = np.stack([envs.single_action_space.sample() for _ in range(args.num_envs)], axis=0)
+    else:
+        action_list = []
+        for idx in range(args.num_envs):
+            action, latent_states[idx], prev_actions[idx] = act(
+                model,
+                observations[idx],
+                latent_states[idx],
+                prev_actions[idx],
+                device,
+                deterministic=False,
+                expl_amount=args.expl_amount,
+            )
+            action_list.append(action.astype(np.float32))
+        actions = np.stack(action_list, axis=0)
+
+    next_obs, rewards, terminated, truncated, _ = envs.step(actions)
+    done = np.logical_or(terminated, truncated)
+
+    for idx in range(args.num_envs):
+        episode_storage[idx]["obs"].append(observations[idx])
+        episode_storage[idx]["action"].append(actions[idx].astype(np.float32))
+        episode_storage[idx]["reward"].append(float(rewards[idx]))
+        episode_storage[idx]["done"].append(bool(done[idx]))
+        episode_returns[idx] += float(rewards[idx])
+        episode_lengths[idx] += 1
+
+        if done[idx]:
+            buffer.add_episode(
+                np.array(episode_storage[idx]["obs"]),
+                np.array(episode_storage[idx]["action"]),
+                np.array(episode_storage[idx]["reward"], dtype=np.float32),
+                np.array(episode_storage[idx]["done"], dtype=np.float32),
+            )
+            logger.log(
+                {
+                    "charts/episodic_return": float(episode_returns[idx]),
+                    "charts/episodic_length": float(episode_lengths[idx]),
+                },
+                step=total_env_steps + idx,
+            )
+            episode_storage[idx] = {"obs": [], "action": [], "reward": [], "done": []}
+            episode_returns[idx] = 0.0
+            episode_lengths[idx] = 0
+            latent_states[idx] = None
+            prev_actions[idx] = None
+
+    collect_vectorized_steps.observations = next_obs
+    return envs, next_obs, latent_states, prev_actions, episode_storage, episode_returns, episode_lengths
+
+
+collect_vectorized_steps.observations = None
+
+if __name__ == "__main__":
+    args = parse_args()
+    set_seed(args.seed)
+    device = get_device()
+
+    env = make_env_fn(args, 0)()
+
+    def eval_env_fn():
+        return make_env_fn(args, 100)()
 
     obs_shape = env.observation_space.shape
     action_dim = int(np.prod(env.action_space.shape))
@@ -693,6 +800,7 @@ if __name__ == "__main__":
     )
     actor_opt = optim.Adam(model.actor.parameters(), lr=args.actor_lr)
     value_opt = optim.Adam(model.value.parameters(), lr=args.value_lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp and device.type == "cuda"))
 
     buffer = ReplayBuffer(
         capacity=args.buffer_size,
@@ -713,80 +821,146 @@ if __name__ == "__main__":
         f"params={sum(p.numel() for p in model.parameters()) / 1e6:.2f}M"
     )
 
-    obs, _ = env.reset(seed=args.seed)
-    episode_return = 0.0
-    episode_length = 0
-    latent_state = None
-    prev_action = None
+    if args.num_envs > 1:
+        env.close()
+        envs = gym.vector.SyncVectorEnv([make_env_fn(args, i) for i in range(args.num_envs)])
+        obs, _ = envs.reset(seed=args.seed)
+        collect_vectorized_steps.observations = obs
+        latent_states = [None for _ in range(args.num_envs)]
+        prev_actions = [None for _ in range(args.num_envs)]
+        episode_storage = [{"obs": [], "action": [], "reward": [], "done": []} for _ in range(args.num_envs)]
+        episode_returns = np.zeros(args.num_envs, dtype=np.float32)
+        episode_lengths = np.zeros(args.num_envs, dtype=np.int32)
+        total_env_steps = 0
+        train_counter = 0
 
-    for step in range(args.total_steps):
-        if step < args.prefill_steps:
-            action = env.action_space.sample()
-        else:
-            action, latent_state, prev_action = act(
+        while total_env_steps < args.total_steps:
+            envs, obs, latent_states, prev_actions, episode_storage, episode_returns, episode_lengths = collect_vectorized_steps(
+                envs,
                 model,
-                obs,
-                latent_state,
-                prev_action,
+                buffer,
+                args,
                 device,
-                deterministic=False,
-                expl_amount=args.expl_amount,
+                total_env_steps,
+                latent_states,
+                prev_actions,
+                episode_storage,
+                episode_returns,
+                episode_lengths,
+                logger,
             )
+            total_env_steps += args.num_envs
+            train_counter += args.num_envs
 
-        next_obs, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        buffer.add_step(obs, action.astype(np.float32), float(reward), done)
+            if total_env_steps >= args.prefill_steps and buffer.num_episodes >= 1 and train_counter >= args.train_every:
+                train_counter = 0
+                metrics = None
+                for _ in range(args.train_steps):
+                    try:
+                        batch = buffer.sample(args.batch_size, seq_len=args.batch_length + 1)
+                    except ValueError:
+                        break
+                    metrics = train_step(model, model_opt, actor_opt, value_opt, batch, args, device, scaler)
+                if metrics is not None:
+                    logger.log(metrics, step=total_env_steps)
 
-        episode_return += reward
-        episode_length += 1
-        obs = next_obs
+            if total_env_steps > 0 and total_env_steps % args.eval_freq < args.num_envs:
+                model.eval()
+                eval_result = evaluate_agent(
+                    model,
+                    eval_env_fn,
+                    num_episodes=args.eval_episodes,
+                    device=device,
+                    eval_noise=args.eval_noise,
+                )
+                print(
+                    f"Step {total_env_steps:>7d} | eval={eval_result['mean_return']:.1f} "
+                    f"+/- {eval_result['std_return']:.1f}"
+                )
+                logger.log(
+                    {
+                        "charts/eval_return": eval_result["mean_return"],
+                        "charts/eval_std": eval_result["std_return"],
+                    },
+                    step=total_env_steps,
+                )
+                model.train()
+        envs.close()
+    else:
+        obs, _ = env.reset(seed=args.seed)
+        episode_return = 0.0
+        episode_length = 0
+        latent_state = None
+        prev_action = None
 
-        if done:
-            logger.log(
-                {
-                    "charts/episodic_return": episode_return,
-                    "charts/episodic_length": episode_length,
-                },
-                step=step,
-            )
-            obs, _ = env.reset()
-            episode_return = 0.0
-            episode_length = 0
-            latent_state = None
-            prev_action = None
+        for step in range(args.total_steps):
+            if step < args.prefill_steps:
+                action = env.action_space.sample()
+            else:
+                action, latent_state, prev_action = act(
+                    model,
+                    obs,
+                    latent_state,
+                    prev_action,
+                    device,
+                    deterministic=False,
+                    expl_amount=args.expl_amount,
+                )
 
-        if step >= args.prefill_steps and buffer.num_episodes >= 1 and step % args.train_every == 0:
-            metrics = None
-            for _ in range(args.train_steps):
-                try:
-                    batch = buffer.sample(args.batch_size, seq_len=args.batch_length + 1)
-                except ValueError:
-                    break
-                metrics = train_step(model, model_opt, actor_opt, value_opt, batch, args, device)
-            if metrics is not None:
-                logger.log(metrics, step=step)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            buffer.add_step(obs, action.astype(np.float32), float(reward), done)
 
-        if step > 0 and step % args.eval_freq == 0:
-            model.eval()
-            eval_result = evaluate_agent(
-                model,
-                eval_env_fn,
-                num_episodes=args.eval_episodes,
-                device=device,
-                eval_noise=args.eval_noise,
-            )
-            print(
-                f"Step {step:>7d} | eval={eval_result['mean_return']:.1f} "
-                f"+/- {eval_result['std_return']:.1f}"
-            )
-            logger.log(
-                {
-                    "charts/eval_return": eval_result["mean_return"],
-                    "charts/eval_std": eval_result["std_return"],
-                },
-                step=step,
-            )
-            model.train()
+            episode_return += reward
+            episode_length += 1
+            obs = next_obs
+
+            if done:
+                logger.log(
+                    {
+                        "charts/episodic_return": episode_return,
+                        "charts/episodic_length": episode_length,
+                    },
+                    step=step,
+                )
+                obs, _ = env.reset()
+                episode_return = 0.0
+                episode_length = 0
+                latent_state = None
+                prev_action = None
+
+            if step >= args.prefill_steps and buffer.num_episodes >= 1 and step % args.train_every == 0:
+                metrics = None
+                for _ in range(args.train_steps):
+                    try:
+                        batch = buffer.sample(args.batch_size, seq_len=args.batch_length + 1)
+                    except ValueError:
+                        break
+                    metrics = train_step(model, model_opt, actor_opt, value_opt, batch, args, device, scaler)
+                if metrics is not None:
+                    logger.log(metrics, step=step)
+
+            if step > 0 and step % args.eval_freq == 0:
+                model.eval()
+                eval_result = evaluate_agent(
+                    model,
+                    eval_env_fn,
+                    num_episodes=args.eval_episodes,
+                    device=device,
+                    eval_noise=args.eval_noise,
+                )
+                print(
+                    f"Step {step:>7d} | eval={eval_result['mean_return']:.1f} "
+                    f"+/- {eval_result['std_return']:.1f}"
+                )
+                logger.log(
+                    {
+                        "charts/eval_return": eval_result["mean_return"],
+                        "charts/eval_std": eval_result["std_return"],
+                    },
+                    step=step,
+                )
+                model.train()
 
     torch.save(
         {
@@ -797,4 +971,5 @@ if __name__ == "__main__":
         f"dreamer_{args.env_id}_s{args.seed}.pt",
     )
     logger.close()
-    env.close()
+    if args.num_envs == 1:
+        env.close()

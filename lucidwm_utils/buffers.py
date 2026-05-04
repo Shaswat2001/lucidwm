@@ -87,6 +87,33 @@ class ReplayBuffer:
                 removed = self._episodes.pop(0)
                 self._total_steps -= len(removed["reward"])
 
+    def add_episode(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        done: np.ndarray,
+    ):
+        """Add a completed episode directly.
+
+        Useful for vectorized collection where multiple partial episodes are
+        tracked outside the replay buffer.
+        """
+        episode = {
+            "obs": np.array(obs),
+            "action": np.array(action),
+            "reward": np.array(reward, dtype=np.float32),
+            "done": np.array(done, dtype=np.float32),
+        }
+        if len(episode["reward"]) == 0:
+            return
+        self._episodes.append(episode)
+        self._total_steps += len(episode["reward"])
+
+        while self._total_steps > self.capacity and len(self._episodes) > 1:
+            removed = self._episodes.pop(0)
+            self._total_steps -= len(removed["reward"])
+
     def sample(
         self, batch_size: int, seq_len: int | None = None
     ) -> dict[str, np.ndarray]:

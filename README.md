@@ -12,6 +12,7 @@ LucidWM puts each algorithm in one Python file. You read one file, you understan
 |-----------|------|--------|-------------|
 | World Models | `wm_carracing.py` | VAE+RNN | VAE + MDN-RNN + CMA-ES controller, with a simplified training pipeline |
 | Dreamer V1 | `dreamer_dmcontrol.py` | Latent imagination | Gaussian RSSM + imagination actor-critic on DMControl pixels |
+| DIAMOND | `diamond_atari.py` | Diffusion world model | Diffusion next-frame model + reward/termination CNN-LSTM + imagined actor-critic on Atari |
 | TD-MPC2 | `tdmpc2_dmcontrol.py` | Implicit | No decoder. SimNorm latent + MPPI planning. Online + offline (HuggingFace) |
 | PWM | `pwm_dmcontrol.py` | Implicit | Same WM as TD-MPC2, but learns policy via first-order gradients through frozen dynamics |
 | PWM (MuJoCo) | `pwm_mujoco.py` | Implicit | PWM trained on Minari offline datasets (HalfCheetah, Hopper, Ant, etc.) |
@@ -28,6 +29,7 @@ lucidwm_components/     Layer 1: Reusable building blocks
 lucidwm/                Layer 2: Single-file algorithms
 ├── wm_carracing.py        651 LOC, fully implemented
 ├── dreamer_dmcontrol.py   Dreamer V1-style implementation for DMControl pixels
+├── diamond_atari.py       DIAMOND-style implementation for Atari RGB observations
 ├── tdmpc2_dmcontrol.py    TD-MPC2-style implementation (online + offline)
 ├── pwm_dmcontrol.py       PWM-style implementation
 ├── pwm_mujoco.py          PWM on Minari datasets
@@ -65,6 +67,9 @@ python -m lucidwm.wm_carracing --seed 1
 # Dreamer V1 on DMControl pixels
 python -m lucidwm.dreamer_dmcontrol --env-id walker-walk --seed 1 --track
 
+# DIAMOND on Atari
+python -m lucidwm.diamond_atari --env-id BreakoutNoFrameskip-v4 --seed 1 --track
+
 # TD-MPC2: online training on DMControl
 python -m lucidwm.tdmpc2_dmcontrol --env-id walker-walk --seed 1 --track
 
@@ -97,6 +102,8 @@ The library spans five distinct paradigm families:
 **VAE + RNN** (World Models): The original. Learn a compressed visual model and a recurrent dynamics model separately, then optimize a tiny controller entirely inside the dream.
 
 **Latent Imagination / RSSM** (Dreamer): Learn a recurrent stochastic state-space model with reconstruction and reward prediction, then optimize an actor and value function directly through imagined latent rollouts.
+
+**Diffusion World Model** (DIAMOND): Predict future Atari frames directly in pixel space with an EDM-style denoiser, then train a recurrent policy and value function entirely inside imagined rollouts.
 
 **Implicit / SimNorm** (TD-MPC2, PWM): No decoder, no reconstruction. Predict next latent, reward, and value directly. SimNorm prevents latent blowup. TD-MPC2 plans with MPPI at test time. PWM shows you can skip planning entirely and learn a better policy by backpropagating through the frozen dynamics.
 
