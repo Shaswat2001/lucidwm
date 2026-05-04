@@ -13,3 +13,10 @@ def set_seed(seed):
 def get_device():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return device
+
+def set_requires_grad(modules: list[nn.Module], requires_grad: bool):
+    for module in modules:
+        if module is None:
+            continue
+        for param in module.parameters():
+            param.requires_grad_(requires_grad)

@@ -26,7 +26,6 @@ import numpy as np
 from dataclasses import dataclass
 from contextlib import nullcontext
 
-import gymnasium as gym
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -37,7 +36,7 @@ from lucidwm_components.networks import MLP
 from lucidwm_utils.buffers import ReplayBuffer
 from lucidwm_utils.envs import make_env
 from lucidwm_utils.logger import Logger
-from lucidwm_utils.misc import get_device, set_seed
+from lucidwm_utils.misc import get_device, set_seed, set_requires_grad
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LucidWM: Dreamer V1 on DMControl")
@@ -134,13 +133,6 @@ def detach_state(state: RSSMState) -> RSSMState:
         stoch=state.stoch.detach(),
         deter=state.deter.detach(),
     )
-
-def set_requires_grad(modules: list[nn.Module], requires_grad: bool):
-    for module in modules:
-        if module is None:
-            continue
-        for param in module.parameters():
-            param.requires_grad_(requires_grad)
 
 def preprocess_obs(obs: torch.Tensor) -> torch.Tensor:
     return obs - 0.5
@@ -706,8 +698,41 @@ def make_env_fn(args, seed_offset: int = 0):
         )
     return thunk
 
-def collect_vectorized_steps(
-    envs,
+def reset_env_batch(
+    envs: list,
+    base_seed: int | None = None,
+):
+    observations = []
+    for idx, env in enumerate(envs):
+        seed = None if base_seed is None else base_seed + idx
+        obs, _ = env.reset(seed=seed)
+        observations.append(obs)
+    return np.stack(observations, axis=0)
+
+def step_env_batch(
+    envs: list,
+    actions: np.ndarray,
+):
+    next_obs = []
+    rewards = []
+    dones = []
+    for idx, env in enumerate(envs):
+        obs, reward, terminated, truncated, _ = env.step(actions[idx])
+        done = terminated or truncated
+        if done:
+            obs, _ = env.reset()
+        next_obs.append(obs)
+        rewards.append(reward)
+        dones.append(done)
+    return (
+        np.stack(next_obs, axis=0),
+        np.asarray(rewards, dtype=np.float32),
+        np.asarray(dones, dtype=np.bool_),
+    )
+
+def collect_batched_steps(
+    envs: list,
+    observations: np.ndarray,
     model: DreamerModel,
     buffer: ReplayBuffer,
     args,
@@ -720,10 +745,8 @@ def collect_vectorized_steps(
     episode_lengths: np.ndarray,
     logger: Logger,
 ):
-    observations = collect_vectorized_steps.observations
-
     if total_env_steps < args.prefill_steps:
-        actions = np.stack([envs.single_action_space.sample() for _ in range(args.num_envs)], axis=0)
+        actions = np.stack([env.action_space.sample() for env in envs], axis=0)
     else:
         action_list = []
         for idx in range(args.num_envs):
@@ -739,8 +762,7 @@ def collect_vectorized_steps(
             action_list.append(action.astype(np.float32))
         actions = np.stack(action_list, axis=0)
 
-    next_obs, rewards, terminated, truncated, _ = envs.step(actions)
-    done = np.logical_or(terminated, truncated)
+    next_obs, rewards, done = step_env_batch(envs, actions)
 
     for idx in range(args.num_envs):
         episode_storage[idx]["obs"].append(observations[idx])
@@ -770,11 +792,7 @@ def collect_vectorized_steps(
             latent_states[idx] = None
             prev_actions[idx] = None
 
-    collect_vectorized_steps.observations = next_obs
     return envs, next_obs, latent_states, prev_actions, episode_storage, episode_returns, episode_lengths
-
-
-collect_vectorized_steps.observations = None
 
 if __name__ == "__main__":
     args = parse_args()
@@ -821,146 +839,69 @@ if __name__ == "__main__":
         f"params={sum(p.numel() for p in model.parameters()) / 1e6:.2f}M"
     )
 
-    if args.num_envs > 1:
-        env.close()
-        envs = gym.vector.SyncVectorEnv([make_env_fn(args, i) for i in range(args.num_envs)])
-        obs, _ = envs.reset(seed=args.seed)
-        collect_vectorized_steps.observations = obs
-        latent_states = [None for _ in range(args.num_envs)]
-        prev_actions = [None for _ in range(args.num_envs)]
-        episode_storage = [{"obs": [], "action": [], "reward": [], "done": []} for _ in range(args.num_envs)]
-        episode_returns = np.zeros(args.num_envs, dtype=np.float32)
-        episode_lengths = np.zeros(args.num_envs, dtype=np.int32)
-        total_env_steps = 0
-        train_counter = 0
+    env.close()
+    envs = [make_env_fn(args, i)() for i in range(args.num_envs)]
+    observations = reset_env_batch(envs, base_seed=args.seed)
+    latent_states = [None for _ in range(args.num_envs)]
+    prev_actions = [None for _ in range(args.num_envs)]
+    episode_storage = [{"obs": [], "action": [], "reward": [], "done": []} for _ in range(args.num_envs)]
+    episode_returns = np.zeros(args.num_envs, dtype=np.float32)
+    episode_lengths = np.zeros(args.num_envs, dtype=np.int32)
+    total_env_steps = 0
+    train_counter = 0
 
-        while total_env_steps < args.total_steps:
-            envs, obs, latent_states, prev_actions, episode_storage, episode_returns, episode_lengths = collect_vectorized_steps(
-                envs,
+    while total_env_steps < args.total_steps:
+        envs, observations, latent_states, prev_actions, episode_storage, episode_returns, episode_lengths = collect_batched_steps(
+            envs,
+            observations,
+            model,
+            buffer,
+            args,
+            device,
+            total_env_steps,
+            latent_states,
+            prev_actions,
+            episode_storage,
+            episode_returns,
+            episode_lengths,
+            logger,
+        )
+        total_env_steps += args.num_envs
+        train_counter += args.num_envs
+
+        if total_env_steps >= args.prefill_steps and buffer.num_episodes >= 1 and train_counter >= args.train_every:
+            train_counter = 0
+            metrics = None
+            for _ in range(args.train_steps):
+                try:
+                    batch = buffer.sample(args.batch_size, seq_len=args.batch_length + 1)
+                except ValueError:
+                    break
+                metrics = train_step(model, model_opt, actor_opt, value_opt, batch, args, device, scaler)
+            if metrics is not None:
+                logger.log(metrics, step=total_env_steps)
+
+        if total_env_steps > 0 and total_env_steps % args.eval_freq < args.num_envs:
+            model.eval()
+            eval_result = evaluate_agent(
                 model,
-                buffer,
-                args,
-                device,
-                total_env_steps,
-                latent_states,
-                prev_actions,
-                episode_storage,
-                episode_returns,
-                episode_lengths,
-                logger,
+                eval_env_fn,
+                num_episodes=args.eval_episodes,
+                device=device,
+                eval_noise=args.eval_noise,
             )
-            total_env_steps += args.num_envs
-            train_counter += args.num_envs
-
-            if total_env_steps >= args.prefill_steps and buffer.num_episodes >= 1 and train_counter >= args.train_every:
-                train_counter = 0
-                metrics = None
-                for _ in range(args.train_steps):
-                    try:
-                        batch = buffer.sample(args.batch_size, seq_len=args.batch_length + 1)
-                    except ValueError:
-                        break
-                    metrics = train_step(model, model_opt, actor_opt, value_opt, batch, args, device, scaler)
-                if metrics is not None:
-                    logger.log(metrics, step=total_env_steps)
-
-            if total_env_steps > 0 and total_env_steps % args.eval_freq < args.num_envs:
-                model.eval()
-                eval_result = evaluate_agent(
-                    model,
-                    eval_env_fn,
-                    num_episodes=args.eval_episodes,
-                    device=device,
-                    eval_noise=args.eval_noise,
-                )
-                print(
-                    f"Step {total_env_steps:>7d} | eval={eval_result['mean_return']:.1f} "
-                    f"+/- {eval_result['std_return']:.1f}"
-                )
-                logger.log(
-                    {
-                        "charts/eval_return": eval_result["mean_return"],
-                        "charts/eval_std": eval_result["std_return"],
-                    },
-                    step=total_env_steps,
-                )
-                model.train()
-        envs.close()
-    else:
-        obs, _ = env.reset(seed=args.seed)
-        episode_return = 0.0
-        episode_length = 0
-        latent_state = None
-        prev_action = None
-
-        for step in range(args.total_steps):
-            if step < args.prefill_steps:
-                action = env.action_space.sample()
-            else:
-                action, latent_state, prev_action = act(
-                    model,
-                    obs,
-                    latent_state,
-                    prev_action,
-                    device,
-                    deterministic=False,
-                    expl_amount=args.expl_amount,
-                )
-
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            buffer.add_step(obs, action.astype(np.float32), float(reward), done)
-
-            episode_return += reward
-            episode_length += 1
-            obs = next_obs
-
-            if done:
-                logger.log(
-                    {
-                        "charts/episodic_return": episode_return,
-                        "charts/episodic_length": episode_length,
-                    },
-                    step=step,
-                )
-                obs, _ = env.reset()
-                episode_return = 0.0
-                episode_length = 0
-                latent_state = None
-                prev_action = None
-
-            if step >= args.prefill_steps and buffer.num_episodes >= 1 and step % args.train_every == 0:
-                metrics = None
-                for _ in range(args.train_steps):
-                    try:
-                        batch = buffer.sample(args.batch_size, seq_len=args.batch_length + 1)
-                    except ValueError:
-                        break
-                    metrics = train_step(model, model_opt, actor_opt, value_opt, batch, args, device, scaler)
-                if metrics is not None:
-                    logger.log(metrics, step=step)
-
-            if step > 0 and step % args.eval_freq == 0:
-                model.eval()
-                eval_result = evaluate_agent(
-                    model,
-                    eval_env_fn,
-                    num_episodes=args.eval_episodes,
-                    device=device,
-                    eval_noise=args.eval_noise,
-                )
-                print(
-                    f"Step {step:>7d} | eval={eval_result['mean_return']:.1f} "
-                    f"+/- {eval_result['std_return']:.1f}"
-                )
-                logger.log(
-                    {
-                        "charts/eval_return": eval_result["mean_return"],
-                        "charts/eval_std": eval_result["std_return"],
-                    },
-                    step=step,
-                )
-                model.train()
+            print(
+                f"Step {total_env_steps:>7d} | eval={eval_result['mean_return']:.1f} "
+                f"+/- {eval_result['std_return']:.1f}"
+            )
+            logger.log(
+                {
+                    "charts/eval_return": eval_result["mean_return"],
+                    "charts/eval_std": eval_result["std_return"],
+                },
+                step=total_env_steps,
+            )
+            model.train()
 
     torch.save(
         {
@@ -971,5 +912,5 @@ if __name__ == "__main__":
         f"dreamer_{args.env_id}_s{args.seed}.pt",
     )
     logger.close()
-    if args.num_envs == 1:
+    for env in envs:
         env.close()
