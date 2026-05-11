@@ -208,3 +208,4 @@ __marimo__/
 runs/
 exp/
 wandb/
+checkpoints/

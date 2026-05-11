@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import torch
 import torch.optim as optim
@@ -23,7 +24,7 @@ from lucidwm_utils.logger import Logger
 from lucidwm_utils.misc import set_seed, get_device
 
 from .model import PWMModel, PWMPolicy, PWMCriticEnsemble
-from .train import pretrain_world_model, pretrain_world_model_minari, policy_update
+from .train import RunningMeanStd, pretrain_world_model, pretrain_world_model_minari, policy_update
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LucidWM: PWM")
@@ -45,22 +46,27 @@ def parse_args():
                         help="Minari dataset ID (mujoco only)")
     parser.add_argument("--wm-checkpoint", type=str, default=None)
     parser.add_argument("--wm-lr", type=float, default=3e-4)
-    parser.add_argument("--wm-epochs", type=int, default=100)
+    parser.add_argument("--wm-epochs", type=int, default=50000)
     parser.add_argument("--wm-batch-size", type=int, default=256)
     parser.add_argument("--wm-horizon", type=int, default=16)
     parser.add_argument("--latent-dim", type=int, default=512)
     parser.add_argument("--hidden-dim", type=int, default=512)
-    parser.add_argument("--num-bins", type=int, default=101)
     parser.add_argument("--simnorm-dim", type=int, default=8)
     parser.add_argument("--simnorm-temp", type=float, default=0.5)
     parser.add_argument("--policy-steps", type=int, default=10_000)
-    parser.add_argument("--policy-lr", type=float, default=1e-3)
-    parser.add_argument("--critic-lr", type=float, default=1e-3)
+    parser.add_argument("--policy-lr", type=float, default=2e-3)
+    parser.add_argument("--critic-lr", type=float, default=2e-3)
     parser.add_argument("--policy-batch-size", type=int, default=32)
-    parser.add_argument("--policy-horizon", type=int, default=5)
+    parser.add_argument("--policy-horizon", type=int, default=16)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--lmbd", type=float, default=0.95)
     parser.add_argument("--num-critics", type=int, default=3)
+    parser.add_argument("--no-ret-norm", action="store_true",
+                        help="Disable variance-adaptive return normalization for actor loss")
+    parser.add_argument("--save-freq", type=int, default=1000,
+                        help="Save a checkpoint every N policy steps (0 = only save at end)")
+    parser.add_argument("--logdir", type=str, default="checkpoints",
+                        help="Directory to save all checkpoints")
     return parser.parse_args()
 
 def load_dataset(args):
@@ -86,6 +92,10 @@ if __name__ == "__main__":
         config=vars(args), use_wandb=args.track,
     )
 
+    ckpt_dir = Path(args.logdir) / run_name
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Checkpoints → {ckpt_dir}")
+
     if args.wm_checkpoint:
         print(f"Loading world model from {args.wm_checkpoint}")
         ckpt = torch.load(args.wm_checkpoint, map_location=device, weights_only=False)
@@ -108,10 +118,10 @@ if __name__ == "__main__":
         action_dim = dataset.action_all.shape[-1] if hasattr(dataset, "action_all") else dataset.action_dim
         world_model = PWMModel(obs_dim, action_dim, args).to(device)
         if args.dataset == "dmcontrol":
-            world_model = pretrain_world_model(world_model, dataset, args, device, logger)
+            world_model = pretrain_world_model(world_model, dataset, args, device, logger, ckpt_dir)
         else:
-            world_model = pretrain_world_model_minari(world_model, dataset, args, device, logger)
-        wm_path = f"pwm_wm_{args.dataset}_s{args.seed}.pt"
+            world_model = pretrain_world_model_minari(world_model, dataset, args, device, logger, ckpt_dir)
+        wm_path = ckpt_dir / "world_model.pt"
         torch.save({
             "world_model": world_model.state_dict(),
             "args": {"obs_dim": obs_dim, "action_dim": action_dim},
@@ -125,8 +135,23 @@ if __name__ == "__main__":
     print(f"\nPhase 2: FoG policy learning ({args.policy_steps} steps)")
     policy = PWMPolicy(args, action_dim).to(device)
     critic = PWMCriticEnsemble(args, num_critics=args.num_critics).to(device)
-    policy_opt = optim.Adam(policy.parameters(), lr=args.policy_lr)
-    critic_opt = optim.Adam(critic.parameters(), lr=args.critic_lr)
+
+    # Adam betas (0.7, 0.95): lower β₁ for faster forgetting as policy shifts
+    policy_opt = optim.Adam(policy.parameters(), lr=args.policy_lr, betas=(0.7, 0.95))
+    critic_opt = optim.Adam(critic.parameters(), lr=args.critic_lr, betas=(0.7, 0.95))
+
+    # Linear LR decay to 1e-5 over all policy steps
+    min_lr = 1e-5
+    policy_sched = optim.lr_scheduler.LambdaLR(
+        policy_opt,
+        lr_lambda=lambda s: max(min_lr / args.policy_lr, 1.0 - s / args.policy_steps),
+    )
+    critic_sched = optim.lr_scheduler.LambdaLR(
+        critic_opt,
+        lr_lambda=lambda s: max(min_lr / args.critic_lr, 1.0 - s / args.policy_steps),
+    )
+
+    ret_rms = None if args.no_ret_norm else RunningMeanStd()
 
     eval_env_fn = None
     if args.eval and args.dataset == "mujoco":
@@ -147,12 +172,27 @@ if __name__ == "__main__":
                 dataset.sample_start_states(args.policy_batch_size),
                 dtype=torch.float32, device=device,
             )
-        metrics = policy_update(world_model, policy, critic, policy_opt, critic_opt, start_obs, args)
+        metrics = policy_update(
+            world_model, policy, critic, policy_opt, critic_opt, start_obs, args, ret_rms=ret_rms,
+        )
+        policy_sched.step()
+        critic_sched.step()
         if step % 500 == 0:
             logger.log(metrics, step=step)
             print(f"  Step {step:>6d}/{args.policy_steps}  "
                   f"actor={metrics['losses/actor']:.4f}  "
                   f"critic={metrics['losses/critic']:.4f}")
+        if args.save_freq > 0 and step > 0 and step % args.save_freq == 0:
+            ckpt_path = ckpt_dir / f"policy_step{step:07d}.pt"
+            torch.save({
+                "step": step,
+                "policy": policy.state_dict(),
+                "critic": critic.state_dict(),
+                "policy_opt": policy_opt.state_dict(),
+                "critic_opt": critic_opt.state_dict(),
+                "args": vars(args),
+            }, ckpt_path)
+            print(f"  Saved checkpoint → {ckpt_path.name}")
         if step > 0 and step % args.eval_freq == 0:
             policy.eval()
             def agent_fn(o):
@@ -173,7 +213,14 @@ if __name__ == "__main__":
                 print(f"  Eval failed: {e}")
             policy.train()
 
-    policy_path = f"pwm_policy_{args.dataset}_s{args.seed}.pt"
-    torch.save({"policy": policy.state_dict(), "critic": critic.state_dict(), "args": vars(args)}, policy_path)
-    print(f"\nSaved policy to {policy_path}")
+    final_path = ckpt_dir / "policy_final.pt"
+    torch.save({
+        "step": args.policy_steps,
+        "policy": policy.state_dict(),
+        "critic": critic.state_dict(),
+        "policy_opt": policy_opt.state_dict(),
+        "critic_opt": critic_opt.state_dict(),
+        "args": vars(args),
+    }, final_path)
+    print(f"\nSaved final checkpoint → {final_path}")
     logger.close()

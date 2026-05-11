@@ -76,10 +76,11 @@ class TwoHotDist:
 
         x = torch.clamp(symlog(x), self.low, self.high)
 
-        # Find the nearest bin and weights
-        below = torch.floor((x - self.low) / self.num_bins)
-        above = (below + 1) % self.num_bins
-        bin_offset = ((x - self.low) / self.num_bins - below).unsqueeze(-1)
+        # bin_width = (high - low) / (num_bins - 1): spacing between adjacent bin centres
+        bin_width = (self.high - self.low) / (self.num_bins - 1)
+        below = torch.floor((x - self.low) / bin_width).long().clamp(0, self.num_bins - 2)
+        above = below + 1
+        bin_offset = ((x - self.low) / bin_width - below.float()).unsqueeze(-1)
 
         # Build two-hot
         two_hot = torch.zeros(*x.shape, self.num_bins, device=x.device)
@@ -89,13 +90,13 @@ class TwoHotDist:
         return two_hot
 
     def decode(self, logits: torch.Tensor) -> torch.Tensor:
-        """Decode logits to scalar values via expected value.
+        """Decode logits to scalar values via expected value with symexp.
 
         Args:
             logits: (..., num_bins) raw logits from prediction head
 
         Returns:
-            values: (...) decoded scalar values
+            values: (..., 1) decoded scalar values
         """
         if self.num_bins == 0:
             return logits
@@ -105,3 +106,24 @@ class TwoHotDist:
         logits = F.softmax(logits, dim=-1)
         logits = torch.sum(logits * dreg_bins, dim=-1, keepdim=True)
         return symexp(logits)
+
+    def decode_no_symexp(self, logits: torch.Tensor) -> torch.Tensor:
+        """Decode logits without the final symexp transform.
+
+        Used in first-order gradient (FoG) policy training. symexp has an
+        unbounded derivative near large values; omitting it prevents gradient
+        explosion when backpropagating through multi-step imagined rollouts.
+
+        Args:
+            logits: (..., num_bins) raw logits from prediction head
+
+        Returns:
+            values: (...) decoded scalar values (no symexp, no keepdim)
+        """
+        if self.num_bins == 0:
+            return logits
+        elif self.num_bins == 1:
+            return logits
+        dreg_bins = torch.linspace(self.low, self.high, self.num_bins, device=logits.device, dtype=logits.dtype)
+        probs = F.softmax(logits, dim=-1)
+        return (probs * dreg_bins).sum(dim=-1)
